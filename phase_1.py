@@ -4,16 +4,27 @@
 # !pip install python-bitcoinlib
 # !pip install bitcoinlib
 
+from multiprocessing import Value
+from bitcoin.core import ValidationError
 from bitcoin.rpc import RawProxy
 from btclib.ecc.ssa import sign, verify
 from btclib.ecc import dsa
 from ecdsa import SECP256k1
+from ecdsa.ecdsa import generator_256
+from ecdsa.ellipticcurve import PointJacobi
 from ecdsa.ellipticcurve import Point
 import hashlib
 import struct
 import binascii
 from dilithium_py import dilithium
+#global witness stack
+witness_stack = []
 
+#global execution stack
+exec_stack = []
+
+#global confirmation stack
+confirmation_stack = []
 
 def fund(proxy, address, amount: int):
     """ Generates "amount" * 50 bitcoins to given address, might be halved if over 210000 blocks"""
@@ -45,7 +56,42 @@ def schnorr_to_xonly(schnorr_public_key):
     x_bytes = x.to_bytes(32, byteorder='big')
     return x_bytes
 
-def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key):
+#Format script with only bytes. Specially coded for the script suggested in my paper.
+def script_byte_format(script: str, x_only_pubkey, dil_public_key):
+    script_list = script.split()
+    #Everything in the list is a string
+    script_byte_list = []
+    #All items' byte form follows Bitcoin protocol
+    for item in script_list:
+        #Check for opcode first
+        if item == "OP_IF":
+            script_byte_list.append(b'\x63')
+        elif item == "OP_CHECKSIG":
+            script_byte_list.append(b'\xac')
+        elif item == "OP_ELSE":
+            script_byte_list.append(b'\x64')
+        elif item == "OP_CHECKDILITHIUMSIG":
+            script_byte_list.append(b'\xc0')
+        elif item == "OP_ENDIF":
+            script_byte_list.append(b'\x68')
+        #If less than 255, we can fit in 1 hexedecimal
+        #After checking if it is an opcode, we are certain the item is a public key
+        elif len(item) <= 255:
+            script_byte_list.append(struct.pack('B', len(item)))
+            script_byte_list.append(x_only_pubkey)
+        #If less than 65535, we can fit in 2 hexedecimals, which we will signal with b'\xfd
+        #As per Bitcoin protocol
+        elif len(item) <= 65535:
+            script_byte_list.append(b'\xfd')
+            temp_byte_len = struct.pack('>H', len(item))
+            #Flip for little-endian value
+            temp_byte_len = temp_byte_len[::-1]
+            script_byte_list.append(temp_byte_len)
+            script_byte_list.append(dil_public_key)
+    return b''.join(script_byte_list)
+
+
+def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key, script):
     """
     Creates a message hash for our transaction using information from fabricated transactions
     amount_spent: the amount we are spending in BTC
@@ -75,7 +121,8 @@ def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key):
     raw_hex = transaction_info['hex']
     # Decode the raw transaction
     transaction_decoded = proxy.decoderawtransaction(raw_hex)
-    print(f"Fake transaction: {transaction_decoded}")
+    # print(f"Fake transaction: {transaction_decoded}")
+
     #Serialize as 32-bit little-endian integers
     nVersion_32bit = struct.pack('<I', transaction_decoded['version'])
     nLocktime_32bit = struct.pack('<I', transaction_decoded['locktime'])
@@ -98,6 +145,8 @@ def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key):
     #format is 64-bit little endian (<Q instead of <I)
     spent_amounts_list = []
     #scriptpubkeys (vout section), which will be hashed
+    #Although our script would undoubtedly generate a different scriptPubKey, we can use the random transaction's scriptPubKey
+    #Without loss of generality because the scriptPubKey should be pseudo-random
     scriptpubkeys_list = []
     #output (vout section), which will be hashed
     #format is value (8 bytes, little-endian) + scriptPubKey (compact size length + script bytes)
@@ -116,15 +165,7 @@ def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key):
     #We hard code the script to match Bitcoin Opcode protocol
     #And to match the hybrid script we wish to create
     x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
-    script = (
-        b'\x63' +  # OP_IF
-        struct.pack('B', len(x_only_pubkey)) + x_only_pubkey +  # Push 32 bytes
-        b'\xac' +  # OP_CHECKSIG
-        b'\x64' +  # OP_ELSE
-        b'\xfd\x20\x05' + dil_public_key +  # Push 1312 bytes (varint + data)
-        b'\xc0' +  # OP_CHECKDILITHIUMSIG (hypothetical opcode bit)
-        b'\x68'  # OP_ENDIF
-    )
+    script = script_byte_format(script, x_only_pubkey, dil_public_key)
     tapleaf_hash = hashlib.sha256(bytes([leaf_version]) + compact_size(len(script)) +script).digest()
     
     #Combine previous outputs and double hash
@@ -165,6 +206,158 @@ def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key):
     message_hash = double_sha256(sigmsg)
     return message_hash
 
+def confirm_tweak():
+    global witness_stack
+    control_block = witness_stack.pop()
+    tweak = hashlib.sha256(control_block[1:]).digest()
+    #Generator is the generator we used to get our Schnorr
+    #Public key and private key
+    generator = generator_256
+    #This is our ScriptPubKey calculation, which would usually be confirmed by
+    #Matching with the actual ScriptPubKey.
+    #In this case, we don't really care about this
+    #So everything done here is purely semantics to remove the control block
+    tweaked_curve = int.from_bytes(tweak, 'big') * PointJacobi.from_affine(generator)
+    tweaked_curve_x = tweaked_curve.to_affine().x()
+    scriptPubKey = int.from_bytes(control_block[1:33], 'big') + tweaked_curve_x
+
+def op_if():
+    global witness_stack
+    global exec_stack
+    #Raise error if stack is empty
+    if(not witness_stack):
+        raise ValueError("Witness stack is empty (OP_IF)")
+
+
+    #Boolean should be on top of the witness stack
+    if_bool = witness_stack.pop()
+    #We add given boolean to the execution stack
+    exec_stack.append(if_bool)
+
+def op_checksig(msg):
+    global witness_stack
+    global exec_stack
+    
+    #Signature popped first, public key next
+    #Handle cases where execution stack is empty or has true on top
+    if(not exec_stack):
+        if(len(witness_stack) < 2):
+            raise ValueError("Witness stack is empty (OP_CHECKSIG)")
+        signature = witness_stack.pop()
+        schnorr_public_key = witness_stack.pop()
+        return verify(msg, schnorr_public_key, signature)
+    elif exec_stack[-1]:
+        if(len(witness_stack) < 2):
+            raise ValueError("Witness stack is empty (OP_CHECKSIG)")
+        signature = witness_stack.pop()
+        schnorr_public_key = witness_stack.pop()
+        return verify(msg, schnorr_public_key, signature)
+
+def op_else():
+    global exec_stack
+    #If execution stack is empty
+    if(not exec_stack):
+        raise ValueError("Execution stack is empty (OP_ELSE)")
+    #Flip the boolean in execution stack
+    exec_stack[-1] = not exec_stack[-1]
+
+def op_checkdilithiumsig(msg):
+    global witness_stack
+    global exec_stack
+    
+    #Signature popped first, public key next
+    #Handle cases where execution stack is empty or has true on top
+    if(not exec_stack):
+        if(len(witness_stack) < 2):
+            raise ValueError("Witness stack is empty (OP_CHECKDILITHIUMSIG)")
+        signature = witness_stack.pop()
+        dil_public_key = witness_stack.pop()
+        return dilithium.Dilithium2.verify(dil_public_key, msg, signature)
+    elif exec_stack[-1]:
+        if(len(witness_stack) < 2):
+            raise ValueError("Witness stack is empty (OP_CHECKDILITHIUMSIG)")
+        signature = witness_stack.pop()
+        dil_public_key = witness_stack.pop()
+        return dilithium.Dilithium2.verify(dil_public_key, msg, signature)
+
+def op_endif():
+    global exec_stack
+    #If execution stack is empty
+    if(not exec_stack):
+        raise ValueError("Execution stack is empty (OP_ENDIF)")
+    #Remove the last value in execution stack
+    exec_stack.pop()
+
+def process_script(msg):
+    """
+    Message is necessary input, as Bitcoin generates it from transaction data
+    Since we generated the message from transaction data in the msg_hash function
+    We will forgo the generation here
+    """
+    global confirmation_stack
+    global witness_stack
+
+    script = witness_stack.pop()
+    script_list = script.split()
+    #Run through all the opcodes
+    for item in script_list:
+        #Check for opcode first
+        if item == "OP_IF":
+            op_if()
+        elif item == "OP_CHECKSIG":
+            confirmation_stack.append(op_checksig(msg))
+        elif item == "OP_ELSE":
+            op_else()
+        elif item == "OP_CHECKDILITHIUMSIG":
+            confirmation_stack.append(op_checkdilithiumsig(msg))
+        elif item == "OP_ENDIF":
+            op_endif()
+    
+    #Clear confirmation stack of all None return values
+    confirmation_stack = [item for item in confirmation_stack if item is not None]
+    #If there is no confirmation, raise an error
+    if(not confirmation_stack):
+        raise ValueError("No validation script ran")
+    #TODO: Why is confirmation stack false for both Schnorr and Dil
+    return confirmation_stack.pop()
+
+def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool: bool, script: str):
+    global witness_stack
+    #Generate the message and signatures
+    msg = msg_hash(proxy, amount, schnorr_public_key, dil_public_key, script)
+    schnorr_sig = sign(msg, schnorr_private_key)
+    dil_sig = dilithium.Dilithium2.sign(dil_private_key, msg)
+    #Witness stack executes on a LIFO basis, so the script goes in last and public key and 
+    #signature goes in first
+    if script_path_bool == True:
+        witness_stack.append(schnorr_public_key)
+        witness_stack.append(schnorr_sig)
+    else:
+        witness_stack.append(dil_public_key)
+        witness_stack.append(dil_sig)
+    #Next, we append the boolean that determines which path our script takes
+    witness_stack.append(script_path_bool)
+    #After, we append the script
+    witness_stack.append(script)
+    #Finally, we append the control block, which includes the leaf version, parity of y-coordinate,
+    #Schnorr x-only pubkey, and hashed script. This is used to verify our tweaked pubkey (scriptPubKey).
+    #Leaf version is 0xc0 as per BIP 341
+    temp_x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
+    control_block = bytes([0xc0 + (schnorr_public_key[1] % 2)]) + temp_x_only_pubkey + hashlib.sha256(script_byte_format(script, temp_x_only_pubkey, dil_public_key)).digest()
+    witness_stack.append(control_block)
+
+    #NOW, we execute everything on the witness stack in order
+    #Confirm tweak confirms that our scriptPubKey matches our inputs
+    confirm_tweak()
+    #Process script processes all the opcodes in the script
+    validation = process_script(msg)
+    if(validation):
+        return validation
+    else:
+        raise ValidationError("Signature and Public Key do not match")
+
+
+
 
 def main():
     rpc_url = 'http://joshuageorgedai:333777000@127.0.0.1:18443/wallet/myaddress'
@@ -183,9 +376,19 @@ def main():
     #Fund address 50 bitcoin
     fund(proxy, address, 1)
 
-    
     #We hard code our script used by the hybrid wallet
+    #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
     script = f"OP_IF\n{schnorr_public_key} OP_CHECKSIG\nOP_ELSE\n{dil_public_key} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
+
+    #Script path boolean to determine which public and private key to use
+    #True is Schnorr, False is Dilithium
+    script_path_bool = False
+    #Generate witness and run validation for the witness
+    if(witness(proxy, 1, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool, script)):
+        if (script_path_bool):
+            print("Schnorr signature validation successful!")
+        else:
+            print("Dilithium signature validation successful!")
 
     #TODO: Phase 2 would need a new way of calculating scriptPubKey,
     # as we can't just tweak the public key anymore bcs Dilithium2 pub keys are too long
