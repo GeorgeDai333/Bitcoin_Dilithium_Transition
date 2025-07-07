@@ -57,9 +57,21 @@ def schnorr_to_xonly(schnorr_public_key):
     return x_bytes
 
 #Format script with only bytes. Specially coded for the script suggested in my paper.
+#All opcode bytes checked against bytes provided by Bitcoin source code
 def script_byte_format(script: str, x_only_pubkey, dil_public_key):
-    script_list = script.split()
+    script_preprocessed_list = script.split()
     #Everything in the list is a string
+    #Check for anything that can turn into an integer
+    #If it can, convert it back into a byte string
+    script_list = []
+    for item in script_preprocessed_list:
+        try:
+            is_pubkey = int(item)
+            length = (is_pubkey.bit_length() + 7) // 8
+            item = is_pubkey.to_bytes(length, 'little')
+            script_list.append(item)
+        except ValueError:
+            script_list.append(item)
     script_byte_list = []
     #All items' byte form follows Bitcoin protocol
     for item in script_list:
@@ -69,19 +81,19 @@ def script_byte_format(script: str, x_only_pubkey, dil_public_key):
         elif item == "OP_CHECKSIG":
             script_byte_list.append(b'\xac')
         elif item == "OP_ELSE":
-            script_byte_list.append(b'\x64')
+            script_byte_list.append(b'\x67')
         elif item == "OP_CHECKDILITHIUMSIG":
             script_byte_list.append(b'\xc0')
         elif item == "OP_ENDIF":
             script_byte_list.append(b'\x68')
         #If less than 255, we can fit in 1 hexedecimal
         #After checking if it is an opcode, we are certain the item is a public key
-        elif len(item) <= 255:
-            script_byte_list.append(struct.pack('B', len(item)))
+        elif len(item) <= 255 and isinstance(item, bytes):
+            script_byte_list.append(struct.pack('B', len(x_only_pubkey)))
             script_byte_list.append(x_only_pubkey)
         #If less than 65535, we can fit in 2 hexedecimals, which we will signal with b'\xfd
         #As per Bitcoin protocol
-        elif len(item) <= 65535:
+        elif len(item) <= 65535 and isinstance(item, bytes):
             script_byte_list.append(b'\xfd')
             temp_byte_len = struct.pack('>H', len(item))
             #Flip for little-endian value
@@ -244,14 +256,14 @@ def op_checksig(msg):
         if(len(witness_stack) < 2):
             raise ValueError("Witness stack is empty (OP_CHECKSIG)")
         signature = witness_stack.pop()
-        schnorr_public_key = witness_stack.pop()
-        return verify(msg, schnorr_public_key, signature)
+        x_only_pubkey = witness_stack.pop()
+        return verify(msg, x_only_pubkey, signature)
     elif exec_stack[-1]:
         if(len(witness_stack) < 2):
             raise ValueError("Witness stack is empty (OP_CHECKSIG)")
         signature = witness_stack.pop()
-        schnorr_public_key = witness_stack.pop()
-        return verify(msg, schnorr_public_key, signature)
+        x_only_pubkey = witness_stack.pop()
+        return verify(msg, x_only_pubkey, signature)
 
 def op_else():
     global exec_stack
@@ -318,7 +330,6 @@ def process_script(msg):
     #If there is no confirmation, raise an error
     if(not confirmation_stack):
         raise ValueError("No validation script ran")
-    #TODO: Why is confirmation stack false for both Schnorr and Dil
     return confirmation_stack.pop()
 
 def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool: bool, script: str):
@@ -330,7 +341,7 @@ def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_k
     #Witness stack executes on a LIFO basis, so the script goes in last and public key and 
     #signature goes in first
     if script_path_bool == True:
-        witness_stack.append(schnorr_public_key)
+        witness_stack.append(schnorr_to_xonly(schnorr_public_key))
         witness_stack.append(schnorr_sig)
     else:
         witness_stack.append(dil_public_key)
@@ -343,7 +354,9 @@ def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_k
     #Schnorr x-only pubkey, and hashed script. This is used to verify our tweaked pubkey (scriptPubKey).
     #Leaf version is 0xc0 as per BIP 341
     temp_x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
-    control_block = bytes([0xc0 + (schnorr_public_key[1] % 2)]) + temp_x_only_pubkey + hashlib.sha256(script_byte_format(script, temp_x_only_pubkey, dil_public_key)).digest()
+    temp_script_byte = script_byte_format(script, temp_x_only_pubkey, dil_public_key)
+    leaf_version = 0xc0
+    control_block = bytes([leaf_version + (schnorr_public_key[1] % 2)]) + temp_x_only_pubkey + hashlib.sha256(bytes([leaf_version])+compact_size(len(temp_script_byte))+temp_script_byte).digest()
     witness_stack.append(control_block)
 
     #NOW, we execute everything on the witness stack in order
@@ -378,7 +391,8 @@ def main():
 
     #We hard code our script used by the hybrid wallet
     #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
-    script = f"OP_IF\n{schnorr_public_key} OP_CHECKSIG\nOP_ELSE\n{dil_public_key} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
+    #Convert public keys to integers so split() function works properly on the string
+    script = f"OP_IF\n{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG\nOP_ELSE\n{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
 
     #Script path boolean to determine which public and private key to use
     #True is Schnorr, False is Dilithium
