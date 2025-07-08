@@ -22,6 +22,11 @@ import struct
 import binascii
 from dilithium_py import dilithium
 from secp256k1 import PublicKey
+
+#global proxy
+rpc_url = 'http://joshuageorgedai:333777000@127.0.0.1:18443/wallet/myaddress'
+proxy = RawProxy(service_url=rpc_url)
+
 #global witness stack
 witness_stack = []
 
@@ -35,10 +40,11 @@ confirmation_stack = []
 revealed_p2tr_pubkeys = set()
 
 #global list of opreturns with specific protocol ID and version
-commited_opreturns = set()
+committed_opreturns = {}
 
-def fund(proxy, address, amount: int):
+def fund(address, amount: int):
     """ Generates "amount" * 50 bitcoins to given address, might be halved if over 210000 blocks"""
+    global proxy
     proxy.generatetoaddress(amount, address)
     proxy.generatetoaddress(101, proxy.getnewaddress())  # confirm transaction
 
@@ -66,6 +72,21 @@ def schnorr_to_xonly(schnorr_public_key):
     x = schnorr_public_key[0]
     x_bytes = x.to_bytes(32, byteorder='big')
     return x_bytes
+
+def x_only_to_schnorr(x_only_public_key: bytes):
+    """
+    Transforms an x-only public key to an x and y coordinate
+    using the standard of even y-coordinates
+    """
+    pubkey_even = PublicKey(b'\x02' + x_only_public_key, raw=True)
+    uncompressed_pubkey_even = pubkey_even.serialize(compressed=False)
+    # Extract coordinates explicitly
+    x_coord = uncompressed_pubkey_even[1:33]   # bytes 1-32
+    y_coord = uncompressed_pubkey_even[33:] 
+    # Convert bytes to integers
+    x_int = int.from_bytes(x_coord, 'big')
+    y_int = int.from_bytes(y_coord, 'big')
+    return (x_int, y_int)
 
 #Format script with only bytes. Specially coded for the script suggested in my paper.
 #All opcode bytes checked against bytes provided by Bitcoin source code
@@ -139,12 +160,14 @@ def tweak_pubkey(internal_schnorr_pubkey, script:str) -> bytes:
     tweakedPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
     return tweakedPubKey
 
-def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key, script):
+def msg_hash(amount_spent: float, schnorr_public_key, dil_public_key, script):
     """
     Creates a message hash for our transaction using information from fabricated transactions
     amount_spent: the amount we are spending in BTC
     schnorr_public_key: we only need the x coordinate of our schnorr public key, which we isolate later
     """
+    global proxy
+
     #Epoch is 0x00 for Taproot
     epoch = 0x00
     #Hash type is 0x00 for SIGHASH_ALL
@@ -276,9 +299,10 @@ def op_if():
     #We add given boolean to the execution stack
     exec_stack.append(if_bool)
 
-def op_checksig(msg) -> bool:
+def op_checksig() -> bool:
     global witness_stack
     global exec_stack
+    global proxy
     
     #Target address popped first, public key next
     #Handle cases where execution stack is empty or has true on top
@@ -293,11 +317,12 @@ def op_checksig(msg) -> bool:
             raise ValueError("Witness stack is empty (OP_CHECKSIG)")
         target_address = witness_stack.pop()
         x_only_pubkey = witness_stack.pop()
+        op_return_hash = hashlib.sha256(x_only_pubkey + hashlib.sha256(target_address).digest()).digest()[::-1]
         #Check if public key is unrevealed and committed
         if x_only_pubkey in revealed_p2tr_pubkeys:
             return False
         # Need to reverse the hash because of endian disparity
-        elif hashlib.sha256(x_only_pubkey + hashlib.sha256(target_address).digest()).digest()[::-1] not in commited_opreturns:
+        elif op_return_hash not in committed_opreturns or proxy.getblockchaininfo()['blocks'] - committed_opreturns[op_return_hash] < 10:
             revealed_p2tr_pubkeys.add(x_only_pubkey)
             return False
         revealed_p2tr_pubkeys.add(x_only_pubkey)
@@ -356,7 +381,7 @@ def process_script(msg):
         if item == "OP_IF":
             op_if()
         elif item == "OP_CHECKSIG":
-            confirmation_stack.append(op_checksig(msg))
+            confirmation_stack.append(op_checksig())
         elif item == "OP_ELSE":
             op_else()
         elif item == "OP_CHECKDILITHIUMSIG":
@@ -376,26 +401,31 @@ def process_opreturn_script():
     Don't forget, everything in script list is a string
     """
     global witness_stack
-    global commited_opreturns
+    global committed_opreturns
+    global proxy
+
     if (not witness_stack):
         raise ValueError("Witness stack is empty (process_opreturn_script)")
     script = witness_stack.pop()
     script_list = script.split()
+
+    #Define acceptable conditions and add to committed list
     accepted_versions = ["1"]
     designated_protocol_ID = b'\x43\x44\x52\x50'
     if (script_list[0] == "OP_RETURN"):
         if len(script_list) == 4 and (script_list[1] == f"{designated_protocol_ID}" and script_list[2] in accepted_versions):
-            commited_opreturns.add(int(script_list[3]).to_bytes(32, 'little'))
+            committed_opreturns[int(script_list[3]).to_bytes(32, 'little')] = proxy.getblockchaininfo()['blocks']
     else:
         raise ValueError("Not an OP_RETURN (process_opreturn_script)")
 
-def witness(proxy, amount, schnorr_public_key, dil_public_key, target_address, dil_private_key, script_path_bool: bool, script: str):
+def witness(amount, schnorr_public_key, dil_public_key, target_address, dil_private_key, script_path_bool: bool, script: str):
     """
     Instead of Schnorr private key, we need the target address
     """
+    global proxy
     global witness_stack
     #Generate the message and signatures
-    msg = msg_hash(proxy, amount, schnorr_public_key, dil_public_key, script)
+    msg = msg_hash(amount, schnorr_public_key, dil_public_key, script)
     dil_sig = dilithium.Dilithium2.sign(dil_private_key, msg)
     #Witness stack executes on a LIFO basis, so the script goes in last and public key and 
     #signature goes in first
@@ -471,11 +501,12 @@ def extract_schnorr_pubkeys(tapscript_hex) -> list:
 
     return pubkeys
 
-def get_previous_pubkeys(proxy):
+def get_previous_pubkeys():
     """
     Gathers all revealed Schnorr public keys from input scripts
     """
     global revealed_p2tr_pubkeys
+    global proxy
 
     block_height = proxy.getblockcount()
     for height in range(block_height + 1):
@@ -506,11 +537,8 @@ def get_previous_pubkeys(proxy):
 
 
 def main():
-    rpc_url = 'http://joshuageorgedai:333777000@127.0.0.1:18443/wallet/myaddress'
-    proxy = RawProxy(service_url=rpc_url)
-
     #Gets previously revealed public keys
-    get_previous_pubkeys(proxy)
+    get_previous_pubkeys()
     #Schnorr keys generated as number (private key)
     #Or coordinate (public key)
     schnorr_private_key, schnorr_public_key = dsa.gen_keys()
@@ -522,7 +550,7 @@ def main():
     address = proxy.getnewaddress("", "bech32m")
     
     #Fund address 50 bitcoin
-    fund(proxy, address, 1)
+    fund(address, 1)
 
     #We hard code our script used by the hybrid wallet
     #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
@@ -538,29 +566,57 @@ def main():
 
     #Should send that validation failed (send from our schnorr to unsafe)
     script_path_bool = True
-    witness(proxy, 1, schnorr_public_key, dil_public_key, unsafe_schnorr_public_key, dil_private_key, script_path_bool, script_hybrid)
+    witness(1, schnorr_public_key, dil_public_key, unsafe_schnorr_public_key, dil_private_key, script_path_bool, script_hybrid)
 
     #Commit unsafe
     witness_opreturn(script_opreturn_hybrid)
 
     #With this commit, we can send from unsafe to our tweaked pubkey
-    pubkey_even = PublicKey(b'\x02' + unsafe_schnorr_public_key, raw=True)
-    uncompressed_pubkey_even = pubkey_even.serialize(compressed=False)
-    # Extract coordinates explicitly
-    x_coord = uncompressed_pubkey_even[1:33]   # bytes 1-32
-    y_coord = uncompressed_pubkey_even[33:] 
-    # Convert bytes to integers
-    x_int = int.from_bytes(x_coord, 'big')
-    y_int = int.from_bytes(y_coord, 'big')
-    unsafe_schnorr_public_key = (x_int, y_int)
+    unsafe_schnorr_public_key = x_only_to_schnorr(unsafe_schnorr_public_key)
     script_path_bool = True
-    if(witness(proxy, 1, unsafe_schnorr_public_key, dil_public_key, tweak_pubkey(schnorr_public_key, script_hybrid), dil_private_key, script_path_bool, script_hybrid)):
+    if(witness(1, unsafe_schnorr_public_key, dil_public_key, tweak_pubkey(schnorr_public_key, script_hybrid), dil_private_key, script_path_bool, script_hybrid)):
         print("Committed pubkey sent transaction safely")
 
-    #TODO: Attach a block count to all OP_returns
+    #########THIS ONE SHOULD WORK########
+    schnorr_private_key, schnorr_public_key = dsa.gen_keys()
+
+    #Dilithum keys generated as byte strings
+    dil_public_key, dil_private_key = dilithium.Dilithium2.keygen()
+
+    #Generate new taproot address
+    address = proxy.getnewaddress("", "bech32m")
+
+    #Fund address 50 bitcoin
+    fund(address, 1)
+
+    #We hard code our script used by the hybrid wallet
+    #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
+    #Convert public keys to integers so split() function works properly on the string
+    script_hybrid = f"OP_IF\n{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG\nOP_ELSE\n{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
+
+    protocol_ID = b'\x43\x44\x52\x50'
+    version = 1
+    # Make the generated address the unsafe address we transfer coins away from
+    unsafe_schnorr_public_key = bytes.fromhex(proxy.getaddressinfo(address)['witness_program'])
+    #Opreturn example for hybrid script
+    script_opreturn_hybrid = f"OP_RETURN {protocol_ID} {version} {int.from_bytes(hashlib.sha256(unsafe_schnorr_public_key + hashlib.sha256(tweak_pubkey(schnorr_public_key, script_hybrid)).digest()).digest())}"
+
+    #Commit unsafe public key
+    witness_opreturn(script_opreturn_hybrid)
+
+    #Fund address 50 bitcoin
+    fund(address, 1)
+
+    #Should succeed because of mined blocks
+    unsafe_schnorr_public_key = x_only_to_schnorr(unsafe_schnorr_public_key)
+    script_path_bool = True
+    if(witness(1, unsafe_schnorr_public_key, dil_public_key, tweak_pubkey(schnorr_public_key, script_hybrid), dil_private_key, script_path_bool, script_hybrid)):
+        print("Committed pubkey sent transaction safely")
 
     #TODO: Phase 2 would need a new way of calculating scriptPubKey or just not at all,
     # as we can't just tweak the public key anymore bcs Dilithium2 pub keys are too long
+
+    #TODO: My test file kinda broke, should be close to finishing though
 
 
 
