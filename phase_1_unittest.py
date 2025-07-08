@@ -51,7 +51,7 @@ class TestPhaseOne(unittest.TestCase):
         script = f"OP_IF\n{int.from_bytes(x_only_pubkey, byteorder='little')} OP_CHECKSIG\nOP_ELSE\n{int.from_bytes(dilithium_pubkey, byteorder='little')} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
         #TODO: function failing most likely because there is a byte string config 
         # that makes an empty space, breaking the .split() function
-        self.assertEqual(script_byte_format(script, x_only_pubkey, dilithium_pubkey), b'\x63'+struct.pack('B', len(x_only_pubkey))+x_only_pubkey+b'\xac'+b'\x67'+b'\xfd'+struct.pack('>H', len(dilithium_pubkey))[::-1]+dilithium_pubkey+b'\xc0'+b'\x68')
+        self.assertEqual(script_byte_format(script, x_only_pubkey, dilithium_pubkey), b'\x63'+struct.pack('B', len(x_only_pubkey))+x_only_pubkey+b'\xac'+b'\x67'+b'\x4d'+struct.pack('>H', len(dilithium_pubkey))[::-1]+dilithium_pubkey+b'\xc0'+b'\x68')
 
     #Test the schnorr path of the script and see if verification is successful
     def test_schnorr_verification(self):

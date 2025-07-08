@@ -26,6 +26,9 @@ exec_stack = []
 #global confirmation stack
 confirmation_stack = []
 
+#global list of previously revealed public keys
+revealed_p2tr_pubkeys = set()
+
 def fund(proxy, address, amount: int):
     """ Generates "amount" * 50 bitcoins to given address, might be halved if over 210000 blocks"""
     proxy.generatetoaddress(amount, address)
@@ -59,6 +62,10 @@ def schnorr_to_xonly(schnorr_public_key):
 #Format script with only bytes. Specially coded for the script suggested in my paper.
 #All opcode bytes checked against bytes provided by Bitcoin source code
 def script_byte_format(script: str, x_only_pubkey, dil_public_key):
+    """
+    Input script needs to have the public keys as strings that can
+    be converted into integers (byte strings were messing up the splitting process)
+    """
     script_preprocessed_list = script.split()
     #Everything in the list is a string
     #Check for anything that can turn into an integer
@@ -369,13 +376,83 @@ def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_k
     else:
         raise ValidationError("Signature and Public Key do not match")
 
+def extract_schnorr_pubkeys(tapscript_hex) -> list:
+    pubkeys = []
+    script_bytes = bytes.fromhex(tapscript_hex)
+    i = 0
 
+    while i < len(script_bytes) - 33:  # at least 33 bytes remain
+        opcode = script_bytes[i]
+
+        #Check for 0x4d (PUSH [next 2 bytes] BYTES)
+        if opcode == 0x4d:
+            #Find the next 2 bytes
+            next_two_opcode = script_bytes[i+1:i+3]
+            #Skip through that many indexes
+            skip_index = int.from_bytes(next_two_opcode, 'little')
+            i += skip_index + 2
+            continue
+        # Check for 0x20 (PUSH 32 bytes)
+        if opcode == 0x20:
+            # Extract next 32 bytes as potential pubkey
+            potential_pubkey = script_bytes[i+1:i+33]
+
+            # Next byte after potential_pubkey
+            next_opcode = script_bytes[i+33]
+
+            # Check if next opcode is OP_CHECKSIG (0xac) or OP_CHECKSIGVERIFY (0xad)
+            if next_opcode in (0xac, 0xad):
+                pubkey_hex = potential_pubkey.hex()
+                pubkeys.append(pubkey_hex)
+
+                # Move pointer past this sequence
+                i += 33
+                continue  # restart loop
+
+        i += 1  # increment pointer by 1 if no match
+
+    return pubkeys
+
+def get_previous_pubkeys(proxy):
+    """
+    Gathers all revealed Schnorr public keys
+    """
+    global revealed_p2tr_pubkeys
+
+    block_height = proxy.getblockcount()
+    for height in range(block_height + 1):
+        block_hash = proxy.getblockhash(height)
+        block = proxy.getblock(block_hash, 2)  # verbosity=2 for full details
+        
+        #Find all previously revealed Schnorr public keys (in hex)
+        for tx in block["tx"]:
+            for vin in tx["vin"]:
+                temp_pubkey_list = []
+                #Skip the coinbase input in the genesis block
+                if 'coinbase' in vin:
+                    continue
+                input_list = vin["txinwitness"]
+                
+
+                #Check base case (no script)
+                if len(input_list) == 2:
+                    #Second value is the Schnorr public key
+                    revealed_p2tr_pubkeys.add(input_list[1])
+                elif len(input_list) > 2:
+                    #2nd to last item is always the script, as the last item is always the control block
+                    script = input_list[-2]
+                    temp_pubkey_list = extract_schnorr_pubkeys(script)
+                
+                for pubkey in temp_pubkey_list:
+                    revealed_p2tr_pubkeys.add(pubkey)
 
 
 def main():
     rpc_url = 'http://joshuageorgedai:333777000@127.0.0.1:18443/wallet/myaddress'
     proxy = RawProxy(service_url=rpc_url)
 
+    #Gets previously revealed public keys
+    get_previous_pubkeys(proxy)
     #Schnorr keys generated as number (private key)
     #Or coordinate (public key)
     schnorr_private_key, schnorr_public_key = dsa.gen_keys()
@@ -394,15 +471,6 @@ def main():
     #Convert public keys to integers so split() function works properly on the string
     script = f"OP_IF\n{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG\nOP_ELSE\n{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
 
-    #Script path boolean to determine which public and private key to use
-    #True is Schnorr, False is Dilithium
-    script_path_bool = False
-    #Generate witness and run validation for the witness
-    if(witness(proxy, 1, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool, script)):
-        if (script_path_bool):
-            print("Schnorr signature validation successful!")
-        else:
-            print("Dilithium signature validation successful!")
 
     #TODO: Phase 2 would need a new way of calculating scriptPubKey,
     # as we can't just tweak the public key anymore bcs Dilithium2 pub keys are too long
