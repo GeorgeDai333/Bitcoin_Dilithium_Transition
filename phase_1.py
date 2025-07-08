@@ -3,6 +3,9 @@
 # !pip install btclib
 # !pip install python-bitcoinlib
 # !pip install bitcoinlib
+# !brew install pkg-config
+# !brew install secp256k1
+# !pip install secp256k1
 
 from multiprocessing import Value
 from bitcoin.core import ValidationError
@@ -17,6 +20,7 @@ import hashlib
 import struct
 import binascii
 from dilithium_py import dilithium
+from secp256k1 import PublicKey
 #global witness stack
 witness_stack = []
 
@@ -58,7 +62,7 @@ def schnorr_to_xonly(schnorr_public_key):
 
 #Format script with only bytes. Specially coded for the script suggested in my paper.
 #All opcode bytes checked against bytes provided by Bitcoin source code
-def script_byte_format(script: str, x_only_pubkey, dil_public_key):
+def script_byte_format(script: str):
     script_preprocessed_list = script.split()
     #Everything in the list is a string
     #Check for anything that can turn into an integer
@@ -89,8 +93,8 @@ def script_byte_format(script: str, x_only_pubkey, dil_public_key):
         #If less than 255, we can fit in 1 hexedecimal
         #After checking if it is an opcode, we are certain the item is a public key
         elif len(item) <= 255 and isinstance(item, bytes):
-            script_byte_list.append(struct.pack('B', len(x_only_pubkey)))
-            script_byte_list.append(x_only_pubkey)
+            script_byte_list.append(struct.pack('B', len(item)))
+            script_byte_list.append(item)
         #If less than 65535, we can fit in 2 hexedecimals, which we will signal with b'\x4d
         #As per Bitcoin protocol
         elif len(item) <= 65535 and isinstance(item, bytes):
@@ -99,7 +103,7 @@ def script_byte_format(script: str, x_only_pubkey, dil_public_key):
             #Flip for little-endian value
             temp_byte_len = temp_byte_len[::-1]
             script_byte_list.append(temp_byte_len)
-            script_byte_list.append(dil_public_key)
+            script_byte_list.append(item)
     return b''.join(script_byte_list)
 
 
@@ -177,7 +181,136 @@ def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key, scr
     #We hard code the script to match Bitcoin Opcode protocol
     #And to match the hybrid script we wish to create
     x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
-    script = script_byte_format(script, x_only_pubkey, dil_public_key)
+    script = script_byte_format(script)
+    tapleaf_hash = hashlib.sha256(bytes([leaf_version]) + compact_size(len(script)) +script).digest()
+    
+    #Combine previous outputs and double hash
+    prev_outputs_hash = double_sha256(b''.join(prev_outputs_list))
+
+    #Combine sequences list and double hash
+    sequences_hash = double_sha256(b''.join(sequences_list))
+
+    #Combine spent amounts and double hash
+    spent_amounts_hash = double_sha256(b''.join(spent_amounts_list))
+
+    #Combine script pubkeys and double hash
+    script_pubkeys_hash = double_sha256(b''.join(scriptpubkeys_list))
+
+    #Combine outputs and double hash
+    outputs_hash = double_sha256(b''.join(outputs_list))
+
+    #Find number of inputs in bytes
+    input_num_in_bytes = struct.pack('B',len(transaction_decoded['vin']))
+
+    #Order of sigmsg taken from Bitcoin
+    #Though it should be noted order can be scrambled without loss of generality
+    sigmsg = (
+        bytes([epoch]) + 
+        bytes([hash_type]) + 
+        nVersion_32bit +
+        nLocktime_32bit + 
+        prev_outputs_hash +
+        spent_amounts_hash +
+        script_pubkeys_hash +
+        sequences_hash +
+        outputs_hash +
+        bytes([spend_type]) +
+        input_num_in_bytes +
+        tapleaf_hash
+    )
+
+    message_hash = double_sha256(sigmsg)
+    return message_hash
+
+def tweak_pubkey(internal_schnorr_pubkey, script:str) -> bytes:
+    """
+    Takes in a Schnorr public key (coordinate form) and a script (string form)
+    Returns a tweaked public key 
+    """
+    temp_script_byte = script_byte_format(script)
+    x_only_pubkey = schnorr_to_xonly(internal_schnorr_pubkey)
+    leaf_version = 0xc0
+    leaf_hash = hashlib.sha256(bytes([leaf_version])+compact_size(len(temp_script_byte))+temp_script_byte).digest()
+    tweak = hashlib.sha256((hashlib.sha256("TapTweak".encode()).digest()*2) + x_only_pubkey + leaf_hash).digest()
+    internal_pubkey = PublicKey(b'\x02' + x_only_pubkey, raw=True)
+    tweakedPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
+    return tweakedPubKey
+
+def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key, script):
+    """
+    Creates a message hash for our transaction using information from fabricated transactions
+    amount_spent: the amount we are spending in BTC
+    schnorr_public_key: we only need the x coordinate of our schnorr public key, which we isolate later
+    """
+    #Epoch is 0x00 for Taproot
+    epoch = 0x00
+    #Hash type is 0x00 for SIGHASH_ALL
+    hash_type = 0x00
+    #Spend type is 0x02 for script-path spending
+    spend_type = 0x02
+    #Leaf version is 0xc0 (BIP 341)
+    leaf_version = 0xc0
+    #Script code is the script we are spending from
+    
+    #Generate a fake transaction to use for our txid info
+    #We can do this without loss of generality because we assume that
+    #Our transaction data and previous transaction data would be random in a real Bitcoin chain
+    receiver_address = proxy.getnewaddress()
+    amount_to_send = amount_spent
+    txid = proxy.sendtoaddress(receiver_address, amount_to_send)
+    # Mine a block to confirm transaction (only necessary for regtest)
+    proxy.generatetoaddress(1, proxy.getnewaddress())
+    # Get transaction info
+    transaction_info = proxy.gettransaction(txid)
+    # Get the raw hex
+    raw_hex = transaction_info['hex']
+    # Decode the raw transaction
+    transaction_decoded = proxy.decoderawtransaction(raw_hex)
+    # print(f"Fake transaction: {transaction_decoded}")
+
+    #Serialize as 32-bit little-endian integers
+    nVersion_32bit = struct.pack('<I', transaction_decoded['version'])
+    nLocktime_32bit = struct.pack('<I', transaction_decoded['locktime'])
+    #previous outputs (vin section), which will be hashed
+    #format is txid (32 bytes, little-endian) + vout (32-bit, little-endian)
+    prev_outputs_list = []
+    #sequences (vin section), which will be hashed
+    #sequences should be a 32-bit little-endian
+    sequences_list = []
+    for trans in transaction_decoded['vin']:
+        #previous outputs handling, convert all to little-endian
+        temp_txid = binascii.unhexlify(trans['txid'])
+        temp_txid = temp_txid[::-1]
+        temp_vout = struct.pack('<I', trans['vout'])
+        prev_outputs_list.append(temp_txid+temp_vout)
+        #sequence handling, convert all to little-endian
+        sequences_list.append(struct.pack('<I', trans['sequence']))
+    
+    #spent amounts (vout section), which will be hashed
+    #format is 64-bit little endian (<Q instead of <I)
+    spent_amounts_list = []
+    #scriptpubkeys (vout section), which will be hashed
+    #Although our script would undoubtedly generate a different scriptPubKey, we can use the random transaction's scriptPubKey
+    #Without loss of generality because the scriptPubKey should be pseudo-random
+    scriptpubkeys_list = []
+    #output (vout section), which will be hashed
+    #format is value (8 bytes, little-endian) + scriptPubKey (compact size length + script bytes)
+    outputs_list = []
+    for transout in transaction_decoded['vout']:
+        #Handle spent amounts, converted into satoshis
+        temp_val = struct.pack('<Q', int(transout['value'] * 100000000))
+        spent_amounts_list.append(temp_val)
+        #Handle scriptpubkey list
+        temp_scriptpubkey = binascii.unhexlify(transout['scriptPubKey']['hex'])
+        temp_scriptpubkey = temp_scriptpubkey[::-1]
+        scriptpubkeys_list.append(temp_scriptpubkey)
+        #Handle outputs list
+        outputs_list.append(temp_val + temp_scriptpubkey)
+
+    #We hard code the script to match Bitcoin Opcode protocol
+    #And to match the hybrid script we wish to create
+    x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
+    script = script_byte_format(script)
     tapleaf_hash = hashlib.sha256(bytes([leaf_version]) + compact_size(len(script)) +script).digest()
     
     #Combine previous outputs and double hash
@@ -221,17 +354,11 @@ def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key, scr
 def confirm_tweak():
     global witness_stack
     control_block = witness_stack.pop()
-    tweak = hashlib.sha256(control_block[1:]).digest()
+    tweak = hashlib.sha256(hashlib.sha256("TapTweak".encode()).digest() + hashlib.sha256("TapTweak".encode()).digest() + control_block[1:]).digest()
     #Generator is the generator we used to get our Schnorr
     #Public key and private key
-    generator = generator_256
-    #This is our ScriptPubKey calculation, which would usually be confirmed by
-    #Matching with the actual ScriptPubKey.
-    #In this case, we don't really care about this
-    #So everything done here is purely semantics to remove the control block
-    tweaked_curve = int.from_bytes(tweak, 'big') * PointJacobi.from_affine(generator)
-    tweaked_curve_x = tweaked_curve.to_affine().x()
-    scriptPubKey = int.from_bytes(control_block[1:33], 'big') + tweaked_curve_x
+    internal_pubkey = PublicKey(b'\x02' + control_block[1:33], raw=True)
+    scriptPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
 
 def op_if():
     global witness_stack
@@ -354,7 +481,7 @@ def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_k
     #Schnorr x-only pubkey, and hashed script. This is used to verify our tweaked pubkey (scriptPubKey).
     #Leaf version is 0xc0 as per BIP 341
     temp_x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
-    temp_script_byte = script_byte_format(script, temp_x_only_pubkey, dil_public_key)
+    temp_script_byte = script_byte_format(script)
     leaf_version = 0xc0
     control_block = bytes([leaf_version + (schnorr_public_key[1] % 2)]) + temp_x_only_pubkey + hashlib.sha256(bytes([leaf_version])+compact_size(len(temp_script_byte))+temp_script_byte).digest()
     witness_stack.append(control_block)
@@ -403,11 +530,6 @@ def main():
             print("Schnorr signature validation successful!")
         else:
             print("Dilithium signature validation successful!")
-
-    #TODO: Phase 2 would need a new way of calculating scriptPubKey,
-    # as we can't just tweak the public key anymore bcs Dilithium2 pub keys are too long
-
-    #TODO: In phase 2, ANY public key checked by OP_CHECKSIG is permanently blacklisted
 
 
 if __name__ == "__main__":

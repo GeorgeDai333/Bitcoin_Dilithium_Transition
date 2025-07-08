@@ -28,8 +28,6 @@ For example, some advantages provided by Schnorr signatures would be lost, such 
 Below, I list the discrepencies of my code's functionalities to real Bitcoin code, as well as why these functional differences are acceptable:
 - Phase 1: The vout scriptPubKeys are not generated with my custom script (should be acceptable because an arbitrary scriptPubKey is no different from a specific one when I am implementing the hybrid wallet and OP_CHECKDILITHIUMSIG)
 
-- Phase 1: The tweaking method needed to remake scriptPubKey from the control block doesn't exactly match Bitcoin's. (Should be acceptable because the tweak and confirmation method is not a priority for my implementation. The original P2TR method should work well enough.)
-
 - Phase 1: My program is not reading my byte script when decoding the script's opcodes. (This level of abstraction is acceptable, as it is unnecessary to read the script in bytes when I already have the script in opcode format)
 
 - Phase 1: My tweaked public keys are not stored on-chain. (Acceptable because, in a real Bitcoin chain, the tweaked public keys would be stored on-chain)

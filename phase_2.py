@@ -3,6 +3,9 @@
 # !pip install btclib
 # !pip install python-bitcoinlib
 # !pip install bitcoinlib
+# !brew install pkg-config
+# !brew install secp256k1
+# !pip install secp256k1
 
 from multiprocessing import Value
 from bitcoin.core import ValidationError
@@ -17,6 +20,7 @@ import hashlib
 import struct
 import binascii
 from dilithium_py import dilithium
+from secp256k1 import PublicKey
 #global witness stack
 witness_stack = []
 
@@ -28,6 +32,9 @@ confirmation_stack = []
 
 #global list of previously revealed public keys
 revealed_p2tr_pubkeys = set()
+
+#global list of opreturns with specific protocol ID and version
+commited_opreturns = set()
 
 def fund(proxy, address, amount: int):
     """ Generates "amount" * 50 bitcoins to given address, might be halved if over 210000 blocks"""
@@ -61,11 +68,7 @@ def schnorr_to_xonly(schnorr_public_key):
 
 #Format script with only bytes. Specially coded for the script suggested in my paper.
 #All opcode bytes checked against bytes provided by Bitcoin source code
-def script_byte_format(script: str, x_only_pubkey, dil_public_key):
-    """
-    Input script needs to have the public keys as strings that can
-    be converted into integers (byte strings were messing up the splitting process)
-    """
+def script_byte_format(script: str):
     script_preprocessed_list = script.split()
     #Everything in the list is a string
     #Check for anything that can turn into an integer
@@ -83,7 +86,19 @@ def script_byte_format(script: str, x_only_pubkey, dil_public_key):
     #All items' byte form follows Bitcoin protocol
     for item in script_list:
         #Check for opcode first
-        if item == "OP_IF":
+        if item == "OP_RETURN":
+            script_list.remove("OP_RETURN")
+            script_byte_list = script_list
+            script_byte_list.insert(0, b'\x6a')
+            script_list = []
+            for subitem in script_byte_list:
+                if not isinstance(subitem, bytes) and isinstance(subitem, str):
+                    script_list.append(subitem[2:-1].encode())
+                elif isinstance(subitem, bytes):
+                    script_list.append(subitem)
+            script_byte_list = script_list
+            break
+        elif item == "OP_IF":
             script_byte_list.append(b'\x63')
         elif item == "OP_CHECKSIG":
             script_byte_list.append(b'\xac')
@@ -96,8 +111,8 @@ def script_byte_format(script: str, x_only_pubkey, dil_public_key):
         #If less than 255, we can fit in 1 hexedecimal
         #After checking if it is an opcode, we are certain the item is a public key
         elif len(item) <= 255 and isinstance(item, bytes):
-            script_byte_list.append(struct.pack('B', len(x_only_pubkey)))
-            script_byte_list.append(x_only_pubkey)
+            script_byte_list.append(struct.pack('B', len(item)))
+            script_byte_list.append(item)
         #If less than 65535, we can fit in 2 hexedecimals, which we will signal with b'\x4d
         #As per Bitcoin protocol
         elif len(item) <= 65535 and isinstance(item, bytes):
@@ -106,9 +121,22 @@ def script_byte_format(script: str, x_only_pubkey, dil_public_key):
             #Flip for little-endian value
             temp_byte_len = temp_byte_len[::-1]
             script_byte_list.append(temp_byte_len)
-            script_byte_list.append(dil_public_key)
+            script_byte_list.append(item)
     return b''.join(script_byte_list)
 
+def tweak_pubkey(internal_schnorr_pubkey, script:str) -> bytes:
+    """
+    Takes in a Schnorr public key (coordinate form) and a script (string form)
+    Returns a tweaked public key 
+    """
+    temp_script_byte = script_byte_format(script)
+    x_only_pubkey = schnorr_to_xonly(internal_schnorr_pubkey)
+    leaf_version = 0xc0
+    leaf_hash = hashlib.sha256(bytes([leaf_version])+compact_size(len(temp_script_byte))+temp_script_byte).digest()
+    tweak = hashlib.sha256((hashlib.sha256("TapTweak".encode()).digest()*2) + x_only_pubkey + leaf_hash).digest()
+    internal_pubkey = PublicKey(b'\x02' + x_only_pubkey, raw=True)
+    tweakedPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
+    return tweakedPubKey
 
 def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key, script):
     """
@@ -184,7 +212,7 @@ def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key, scr
     #We hard code the script to match Bitcoin Opcode protocol
     #And to match the hybrid script we wish to create
     x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
-    script = script_byte_format(script, x_only_pubkey, dil_public_key)
+    script = script_byte_format(script)
     tapleaf_hash = hashlib.sha256(bytes([leaf_version]) + compact_size(len(script)) +script).digest()
     
     #Combine previous outputs and double hash
@@ -228,17 +256,11 @@ def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key, scr
 def confirm_tweak():
     global witness_stack
     control_block = witness_stack.pop()
-    tweak = hashlib.sha256(control_block[1:]).digest()
+    tweak = hashlib.sha256(hashlib.sha256("TapTweak".encode()).digest() + hashlib.sha256("TapTweak".encode()).digest() + control_block[1:]).digest()
     #Generator is the generator we used to get our Schnorr
     #Public key and private key
-    generator = generator_256
-    #This is our ScriptPubKey calculation, which would usually be confirmed by
-    #Matching with the actual ScriptPubKey.
-    #In this case, we don't really care about this
-    #So everything done here is purely semantics to remove the control block
-    tweaked_curve = int.from_bytes(tweak, 'big') * PointJacobi.from_affine(generator)
-    tweaked_curve_x = tweaked_curve.to_affine().x()
-    scriptPubKey = int.from_bytes(control_block[1:33], 'big') + tweaked_curve_x
+    internal_pubkey = PublicKey(b'\x02' + control_block[1:33], raw=True)
+    scriptPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
 
 def op_if():
     global witness_stack
@@ -339,6 +361,24 @@ def process_script(msg):
         raise ValueError("No validation script ran")
     return confirmation_stack.pop()
 
+def process_opreturn_script():
+    """
+    Don't forget, everything in script list is a string
+    """
+    global witness_stack
+    global commited_opreturns
+    if (not witness_stack):
+        raise ValueError("Witness stack is empty (process_opreturn_script)")
+    script = witness_stack.pop()
+    script_list = script.split()
+    accepted_versions = ["1"]
+    designated_protocol_ID = b'\x43\x44\x52\x50'
+    if (script_list[0] == "OP_RETURN"):
+        if len(script_list) == 4 and (script_list[1] == f"{designated_protocol_ID}" and script_list[2] in accepted_versions):
+            commited_opreturns.add(int(script_list[3]).to_bytes(32, 'little'))
+    else:
+        raise ValueError("Not an OP_RETURN (process_opreturn_script)")
+
 def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool: bool, script: str):
     global witness_stack
     #Generate the message and signatures
@@ -361,7 +401,7 @@ def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_k
     #Schnorr x-only pubkey, and hashed script. This is used to verify our tweaked pubkey (scriptPubKey).
     #Leaf version is 0xc0 as per BIP 341
     temp_x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
-    temp_script_byte = script_byte_format(script, temp_x_only_pubkey, dil_public_key)
+    temp_script_byte = script_byte_format(script)
     leaf_version = 0xc0
     control_block = bytes([leaf_version + (schnorr_public_key[1] % 2)]) + temp_x_only_pubkey + hashlib.sha256(bytes([leaf_version])+compact_size(len(temp_script_byte))+temp_script_byte).digest()
     witness_stack.append(control_block)
@@ -375,6 +415,11 @@ def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_k
         return validation
     else:
         raise ValidationError("Signature and Public Key do not match")
+
+def witness_opreturn(script):
+    global witness_stack
+    witness_stack.append(script)
+    process_opreturn_script()
 
 def extract_schnorr_pubkeys(tapscript_hex) -> list:
     pubkeys = []
@@ -415,7 +460,7 @@ def extract_schnorr_pubkeys(tapscript_hex) -> list:
 
 def get_previous_pubkeys(proxy):
     """
-    Gathers all revealed Schnorr public keys
+    Gathers all revealed Schnorr public keys from input scripts
     """
     global revealed_p2tr_pubkeys
 
@@ -462,17 +507,23 @@ def main():
 
     #Generate new taproot address
     address = proxy.getnewaddress("", "bech32m")
-
+    
     #Fund address 50 bitcoin
     fund(proxy, address, 1)
 
     #We hard code our script used by the hybrid wallet
     #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
     #Convert public keys to integers so split() function works properly on the string
-    script = f"OP_IF\n{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG\nOP_ELSE\n{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
+    script_hybrid = f"OP_IF\n{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG\nOP_ELSE\n{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
+    
+    protocol_ID = b'\x43\x44\x52\x50'
+    version = 1
+    # Make the generated address the unsafe address we transfer coins away from
+    unsafe_schnorr_public_key = bytes.fromhex(proxy.getaddressinfo(address)['witness_program'])
+    #Opreturn example for hybrid script
+    script_opreturn_hybrid = f"OP_RETURN {protocol_ID} {version} {int.from_bytes(hashlib.sha256(unsafe_schnorr_public_key + hashlib.sha256(tweak_pubkey(schnorr_public_key, script_hybrid)).digest()).digest())}"
 
-
-    #TODO: Phase 2 would need a new way of calculating scriptPubKey,
+    #TODO: Phase 2 would need a new way of calculating scriptPubKey or just not at all,
     # as we can't just tweak the public key anymore bcs Dilithium2 pub keys are too long
 
     #TODO: In phase 2, ANY public key checked by OP_CHECKSIG is permanently blacklisted
