@@ -6,6 +6,7 @@
 # !brew install pkg-config
 # !brew install secp256k1
 # !pip install secp256k1
+# !pip install coincurve
 
 from multiprocessing import Value
 from bitcoin.core import ValidationError
@@ -275,24 +276,33 @@ def op_if():
     #We add given boolean to the execution stack
     exec_stack.append(if_bool)
 
-def op_checksig(msg):
+def op_checksig(msg) -> bool:
     global witness_stack
     global exec_stack
     
-    #Signature popped first, public key next
+    #Target address popped first, public key next
     #Handle cases where execution stack is empty or has true on top
     if(not exec_stack):
         if(len(witness_stack) < 2):
             raise ValueError("Witness stack is empty (OP_CHECKSIG)")
-        signature = witness_stack.pop()
+        target_address = witness_stack.pop()
         x_only_pubkey = witness_stack.pop()
-        return verify(msg, x_only_pubkey, signature)
+        
     elif exec_stack[-1]:
         if(len(witness_stack) < 2):
             raise ValueError("Witness stack is empty (OP_CHECKSIG)")
-        signature = witness_stack.pop()
+        target_address = witness_stack.pop()
         x_only_pubkey = witness_stack.pop()
-        return verify(msg, x_only_pubkey, signature)
+        #Check if public key is unrevealed and committed
+        if x_only_pubkey in revealed_p2tr_pubkeys:
+            return False
+        # Need to reverse the hash because of endian disparity
+        elif hashlib.sha256(x_only_pubkey + hashlib.sha256(target_address).digest()).digest()[::-1] not in commited_opreturns:
+            revealed_p2tr_pubkeys.add(x_only_pubkey)
+            return False
+        revealed_p2tr_pubkeys.add(x_only_pubkey)
+        return True
+        
 
 def op_else():
     global exec_stack
@@ -379,17 +389,19 @@ def process_opreturn_script():
     else:
         raise ValueError("Not an OP_RETURN (process_opreturn_script)")
 
-def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool: bool, script: str):
+def witness(proxy, amount, schnorr_public_key, dil_public_key, target_address, dil_private_key, script_path_bool: bool, script: str):
+    """
+    Instead of Schnorr private key, we need the target address
+    """
     global witness_stack
     #Generate the message and signatures
     msg = msg_hash(proxy, amount, schnorr_public_key, dil_public_key, script)
-    schnorr_sig = sign(msg, schnorr_private_key)
     dil_sig = dilithium.Dilithium2.sign(dil_private_key, msg)
     #Witness stack executes on a LIFO basis, so the script goes in last and public key and 
     #signature goes in first
     if script_path_bool == True:
         witness_stack.append(schnorr_to_xonly(schnorr_public_key))
-        witness_stack.append(schnorr_sig)
+        witness_stack.append(target_address)
     else:
         witness_stack.append(dil_public_key)
         witness_stack.append(dil_sig)
@@ -414,7 +426,8 @@ def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_k
     if(validation):
         return validation
     else:
-        raise ValidationError("Signature and Public Key do not match")
+        print("Signature and Public Key do not match")
+        return validation
 
 def witness_opreturn(script):
     global witness_stack
@@ -523,10 +536,32 @@ def main():
     #Opreturn example for hybrid script
     script_opreturn_hybrid = f"OP_RETURN {protocol_ID} {version} {int.from_bytes(hashlib.sha256(unsafe_schnorr_public_key + hashlib.sha256(tweak_pubkey(schnorr_public_key, script_hybrid)).digest()).digest())}"
 
+    #Should send that validation failed (send from our schnorr to unsafe)
+    script_path_bool = True
+    witness(proxy, 1, schnorr_public_key, dil_public_key, unsafe_schnorr_public_key, dil_private_key, script_path_bool, script_hybrid)
+
+    #Commit unsafe
+    witness_opreturn(script_opreturn_hybrid)
+
+    #With this commit, we can send from unsafe to our tweaked pubkey
+    pubkey_even = PublicKey(b'\x02' + unsafe_schnorr_public_key, raw=True)
+    uncompressed_pubkey_even = pubkey_even.serialize(compressed=False)
+    # Extract coordinates explicitly
+    x_coord = uncompressed_pubkey_even[1:33]   # bytes 1-32
+    y_coord = uncompressed_pubkey_even[33:] 
+    # Convert bytes to integers
+    x_int = int.from_bytes(x_coord, 'big')
+    y_int = int.from_bytes(y_coord, 'big')
+    unsafe_schnorr_public_key = (x_int, y_int)
+    script_path_bool = True
+    if(witness(proxy, 1, unsafe_schnorr_public_key, dil_public_key, tweak_pubkey(schnorr_public_key, script_hybrid), dil_private_key, script_path_bool, script_hybrid)):
+        print("Committed pubkey sent transaction safely")
+
+    #TODO: Attach a block count to all OP_returns
+
     #TODO: Phase 2 would need a new way of calculating scriptPubKey or just not at all,
     # as we can't just tweak the public key anymore bcs Dilithium2 pub keys are too long
 
-    #TODO: In phase 2, ANY public key checked by OP_CHECKSIG is permanently blacklisted
 
 
 if __name__ == "__main__":
