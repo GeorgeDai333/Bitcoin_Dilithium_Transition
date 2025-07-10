@@ -90,14 +90,15 @@ def script_byte_format(script: str):
             script_byte_list.append(b'\xc0')
         elif item == "OP_ENDIF":
             script_byte_list.append(b'\x68')
-        #If less than 255, we can fit in 1 hexedecimal
+        #If byte count is less than 75, we use no OP_PUSHDATA
         #After checking if it is an opcode, we are certain the item is a public key
-        elif len(item) <= 255 and isinstance(item, bytes):
+        elif len(item) < 75 and isinstance(item, bytes):
             script_byte_list.append(struct.pack('B', len(item)))
             script_byte_list.append(item)
-        #If less than 65535, we can fit in 2 hexedecimals, which we will signal with b'\x4d
-        #As per Bitcoin protocol
-        elif len(item) <= 65535 and isinstance(item, bytes):
+        #If byte count is less than 65535 but greater than 255, 
+        #We can fit in 2 hexedecimals, which we will signal with b'\x4d
+        #(OP_PUSHDATA2) As per Bitcoin protocol
+        elif len(item) < 65535 and len(item) > 255 and isinstance(item, bytes):
             script_byte_list.append(b'\x4d')
             temp_byte_len = struct.pack('>H', len(item))
             #Flip for little-endian value

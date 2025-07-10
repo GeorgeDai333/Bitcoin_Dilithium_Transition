@@ -28,6 +28,10 @@ For example, some advantages provided by Schnorr signatures would be lost, such 
 Below, I list the discrepencies of my code's functionalities to real Bitcoin code, as well as why these functional differences are acceptable:
 - Phase 1: The vout scriptPubKeys are not generated with my custom script (should be acceptable because an arbitrary scriptPubKey is no different from a specific one when I am implementing the hybrid wallet and OP_CHECKDILITHIUMSIG)
 
+- Phase 1: I don't have the OP_PUSHDATA2 opcode in my script. However, I do represent that opcode whenever I need to push a very large object (such as the Dilithium2 signature).
+
+- Phase 1: dsa.genkeys() is not guaranteed to have an even y-value for the public key. (This is acceptable because my equations don't excessively depend on the parity of the y-value of the Schnorr public key)
+
 - Phase 1: My program is not reading my byte script when decoding the script's opcodes. (This level of abstraction is acceptable, as it is unnecessary to read the script in bytes when I already have the script in opcode format)
 
 - Phase 1: My tweaked public keys are not stored on-chain. (Acceptable because, in a real Bitcoin chain, the tweaked public keys would be stored on-chain)
