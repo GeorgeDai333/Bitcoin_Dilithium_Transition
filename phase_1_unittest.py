@@ -66,14 +66,33 @@ class TestPhaseOne(unittest.TestCase):
         #Fund address 50 bitcoin
         fund(self.proxy, address, 1)
 
-        #We hard code our script used by the hybrid wallet
-        #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
-        script = f"OP_IF\n{schnorr_public_key} OP_CHECKSIG\nOP_ELSE\n{dil_public_key} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
+        #We hard code our scripts used by the hybrid wallet
+        script_path_schnorr = f"{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG"
+        script_path_dil = f"{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG"
+
+        #Generate scriptPubKey following Bitcoin protocol
+        leaf_ver = b'\xc0'
+        schnorr_path_bytes = script_byte_format(script_path_schnorr)
+        schnorr_path_hash = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(schnorr_path_bytes))+ schnorr_path_bytes).digest()
+        dil_path_bytes = script_byte_format(script_path_dil)
+        dil_path_hash = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(dil_path_bytes))+ dil_path_bytes).digest()
+        hashed_script_list = [schnorr_path_hash, dil_path_hash]
+        merkle_branch = (hashlib.sha256("TapBranch".encode()).digest() * 2)
+        for branch in sorted(hashed_script_list):
+            merkle_branch += branch
+        merkle_branch = hashlib.sha256(merkle_branch).digest()
+        # Use a NUMS pubkey to force script spending
+        NUMS_pubkey = bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000001")
+        tweak = hashlib.sha256(hashlib.sha256("TapTweak".encode()).digest() + hashlib.sha256("TapTweak".encode()).digest() + NUMS_pubkey + merkle_branch).digest()
+        #Generator is the generator we used to get our Schnorr
+        #Public key and private key
+        internal_pubkey = PublicKey(b'\x02' + NUMS_pubkey, raw=True)
+        scriptPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
 
         #Script path boolean to determine which public and private key to use
         #True is Schnorr, False is Dilithium
         script_path_bool = True
-        self.assertEqual(witness(self.proxy, 1, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool, script), True)
+        self.assertEqual(witness_verification(self.proxy, 1, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool, script_path_schnorr, script_path_dil, scriptPubKey), True)
 
     #Test the Dilithium path of the script and see if verification is successful
     def test_dilithium_verification(self):
@@ -88,14 +107,78 @@ class TestPhaseOne(unittest.TestCase):
         #Fund address 50 bitcoin
         fund(self.proxy, address, 1)
 
-        #We hard code our script used by the hybrid wallet
-        #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
-        script = f"OP_IF\n{schnorr_public_key} OP_CHECKSIG\nOP_ELSE\n{dil_public_key} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
+        #We hard code our scripts used by the hybrid wallet
+        script_path_schnorr = f"{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG"
+        script_path_dil = f"{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG"
+
+        #Generate scriptPubKey following Bitcoin protocol
+        leaf_ver = b'\xc0'
+        schnorr_path_bytes = script_byte_format(script_path_schnorr)
+        schnorr_path_hash = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(schnorr_path_bytes))+ schnorr_path_bytes).digest()
+        dil_path_bytes = script_byte_format(script_path_dil)
+        dil_path_hash = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(dil_path_bytes))+ dil_path_bytes).digest()
+        hashed_script_list = [schnorr_path_hash, dil_path_hash]
+        merkle_branch = (hashlib.sha256("TapBranch".encode()).digest() * 2)
+        for branch in sorted(hashed_script_list):
+            merkle_branch += branch
+        merkle_branch = hashlib.sha256(merkle_branch).digest()
+        # Use a NUMS pubkey to force script spending
+        NUMS_pubkey = bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000001")
+        tweak = hashlib.sha256(hashlib.sha256("TapTweak".encode()).digest() + hashlib.sha256("TapTweak".encode()).digest() + NUMS_pubkey + merkle_branch).digest()
+        #Generator is the generator we used to get our Schnorr
+        #Public key and private key
+        internal_pubkey = PublicKey(b'\x02' + NUMS_pubkey, raw=True)
+        scriptPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
 
         #Script path boolean to determine which public and private key to use
         #True is Schnorr, False is Dilithium
         script_path_bool = False
-        self.assertEqual(witness(self.proxy, 1, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool, script), True)
+        self.assertEqual(witness_verification(self.proxy, 1, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool, script_path_schnorr, script_path_dil, scriptPubKey), True)
+    
+    #Test if a wrong scriptPubKey raises an error
+    #Essentially, this tests if confirm_tweak is working as intended
+    def test_wrong_scriptPubKey_verification(self):
+        schnorr_private_key, schnorr_public_key = dsa.gen_keys()
+
+        #Dilithum keys generated as byte strings
+        dil_public_key, dil_private_key = dilithium.Dilithium2.keygen()
+
+        #Generate new taproot address
+        address = self.proxy.getnewaddress("", "bech32m")
+
+        #Fund address 50 bitcoin
+        fund(self.proxy, address, 1)
+
+        #We hard code our scripts used by the hybrid wallet
+        script_path_schnorr = f"{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG"
+        script_path_dil = f"{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG"
+
+        #Generate scriptPubKey following Bitcoin protocol
+        leaf_ver = b'\xc0'
+        schnorr_path_bytes = script_byte_format(script_path_schnorr)
+        #Added a 1 byte mistake to the script pub key
+        schnorr_path_hash = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(schnorr_path_bytes))+ schnorr_path_bytes + b'\x00').digest()
+        dil_path_bytes = script_byte_format(script_path_dil)
+        dil_path_hash = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(dil_path_bytes))+ dil_path_bytes).digest()
+        hashed_script_list = [schnorr_path_hash, dil_path_hash]
+        merkle_branch = (hashlib.sha256("TapBranch".encode()).digest() * 2)
+        for branch in sorted(hashed_script_list):
+            merkle_branch += branch
+        merkle_branch = hashlib.sha256(merkle_branch).digest()
+        # Use a NUMS pubkey to force script spending
+        NUMS_pubkey = bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000001")
+        tweak = hashlib.sha256(hashlib.sha256("TapTweak".encode()).digest() + hashlib.sha256("TapTweak".encode()).digest() + NUMS_pubkey + merkle_branch).digest()
+        #Generator is the generator we used to get our Schnorr
+        #Public key and private key
+        internal_pubkey = PublicKey(b'\x02' + NUMS_pubkey, raw=True)
+        scriptPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
+
+        #Script path boolean to determine which public and private key to use
+        #True is Schnorr, False is Dilithium
+        script_path_bool = False
+        #See if an error is raised
+        with self.assertRaises(ValidationError):
+            witness_verification(self.proxy, 1, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool, script_path_schnorr, script_path_dil, scriptPubKey)
 
 if __name__ == '__main__':
     unittest.main()

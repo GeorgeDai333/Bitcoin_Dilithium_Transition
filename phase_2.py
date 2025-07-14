@@ -534,88 +534,24 @@ def get_previous_pubkeys():
 
 
 def main():
-    #Gets previously revealed public keys
-    get_previous_pubkeys()
-    #Schnorr keys generated as number (private key)
-    #Or coordinate (public key)
-    schnorr_private_key, schnorr_public_key = dsa.gen_keys()
+    receiver_address = proxy.getnewaddress("", "bech32m")
+    amount_to_send = 0.589
+    txid = proxy.sendtoaddress(receiver_address, amount_to_send)
 
-    #Dilithum keys generated as byte strings
-    dil_public_key, dil_private_key = dilithium.Dilithium2.keygen()
+    #Confirm transaction by mining some blocks
+    mine_to_confirm = 1
+    proxy.generatetoaddress(mine_to_confirm, receiver_address)
 
-    #Generate new taproot address
-    address = proxy.getnewaddress("", "bech32m")
-    
-    #Fund address 50 bitcoin
-    fund(address, 1)
+    #Find transaction info
+    transaction_info = proxy.gettransaction(txid)
+    print(transaction_info)
 
-    #We hard code our script used by the hybrid wallet
-    #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
-    #Convert public keys to integers so split() function works properly on the string
-    script_hybrid = f"OP_IF\n{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG\nOP_ELSE\n{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
-    
-    protocol_ID = b'\x43\x44\x52\x50'
-    version = 1
-    # Make the generated address the unsafe address we transfer coins away from
-    unsafe_schnorr_public_key = bytes.fromhex(proxy.getaddressinfo(address)['witness_program'])
-    #Opreturn example for hybrid script
-    script_opreturn_hybrid = f"OP_RETURN {protocol_ID} {version} {int.from_bytes(hashlib.sha256(unsafe_schnorr_public_key + hashlib.sha256(tweak_pubkey(schnorr_public_key, script_hybrid)).digest()).digest())}"
+    # Get the raw hex
+    raw_hex = transaction_info['hex']
 
-    #Should send that validation failed (send from our schnorr to unsafe)
-    script_path_bool = True
-    if(witness(1, schnorr_public_key, dil_public_key, unsafe_schnorr_public_key, dil_private_key, script_path_bool, script_hybrid)):
-        print("Committed pubkey sent transaction safely")
-    else:
-        print("Verification failed")
-
-    #Commit unsafe
-    witness_opreturn(script_opreturn_hybrid)
-
-    #With this commit, we can send from unsafe to our tweaked pubkey
-    unsafe_schnorr_public_key = x_only_to_schnorr(unsafe_schnorr_public_key)
-    script_path_bool = True
-    if(witness(1, unsafe_schnorr_public_key, dil_public_key, tweak_pubkey(schnorr_public_key, script_hybrid), dil_private_key, script_path_bool, script_hybrid)):
-        print("Committed pubkey sent transaction safely")
-    else:
-        print("Verification failed")
-
-    #########THIS ONE SHOULD WORK########
-    schnorr_private_key, schnorr_public_key = dsa.gen_keys()
-
-    #Dilithum keys generated as byte strings
-    dil_public_key, dil_private_key = dilithium.Dilithium2.keygen()
-
-    #Generate new taproot address
-    address = proxy.getnewaddress("", "bech32m")
-
-    #Fund address 50 bitcoin
-    fund(address, 1)
-
-    #We hard code our script used by the hybrid wallet
-    #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
-    #Convert public keys to integers so split() function works properly on the string
-    script_hybrid = f"OP_IF\n{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG\nOP_ELSE\n{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
-
-    protocol_ID = b'\x43\x44\x52\x50'
-    version = 1
-    # Make the generated address the unsafe address we transfer coins away from
-    unsafe_schnorr_public_key = bytes.fromhex(proxy.getaddressinfo(address)['witness_program'])
-    #Opreturn example for hybrid script
-    script_opreturn_hybrid = f"OP_RETURN {protocol_ID} {version} {int.from_bytes(hashlib.sha256(unsafe_schnorr_public_key + hashlib.sha256(tweak_pubkey(schnorr_public_key, script_hybrid)).digest()).digest())}"
-
-    #Commit unsafe public key
-    witness_opreturn(script_opreturn_hybrid)
-
-    #Fund address 50 bitcoin
-    fund(address, 1)
-
-    #Should succeed because of mined blocks
-    unsafe_schnorr_public_key = x_only_to_schnorr(unsafe_schnorr_public_key)
-    script_path_bool = True
-    if(witness(1, unsafe_schnorr_public_key, dil_public_key, tweak_pubkey(schnorr_public_key, script_hybrid), dil_private_key, script_path_bool, script_hybrid)):
-        print("Committed pubkey sent transaction safely")
-    else:
-        print("Verification failed")
+    # Decode the raw transaction
+    decoded = proxy.decoderawtransaction(raw_hex)
+    print(decoded)
 
     #TODO: Phase 2 would need a new way of calculating scriptPubKey or just not at all,
     # as we can't just tweak the public key anymore bcs Dilithium2 pub keys are too long

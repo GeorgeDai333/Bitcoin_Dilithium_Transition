@@ -352,14 +352,25 @@ def msg_hash(proxy, amount_spent: float, schnorr_public_key, dil_public_key, scr
     message_hash = double_sha256(sigmsg)
     return message_hash
 
-def confirm_tweak():
+def confirm_tweak(script, scriptPubKey):
     global witness_stack
     control_block = witness_stack.pop()
-    tweak = hashlib.sha256(hashlib.sha256("TapTweak".encode()).digest() + hashlib.sha256("TapTweak".encode()).digest() + control_block[1:]).digest()
+    temp_script_bytes = script_byte_format(script)
+    leaf_ver = bytes([control_block[0]])
+    this_script_hashed = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(temp_script_bytes))+ temp_script_bytes).digest()
+    other_scripts_hashed = control_block[33:]
+    merkle_branch = (hashlib.sha256("TapBranch".encode()).digest() * 2)
+    script_list = [this_script_hashed, other_scripts_hashed]
+    for branch in sorted(script_list):
+        merkle_branch += branch
+    merkle_branch = hashlib.sha256(merkle_branch).digest()
+    tweak = hashlib.sha256(hashlib.sha256("TapTweak".encode()).digest() + hashlib.sha256("TapTweak".encode()).digest() + control_block[1:33] + merkle_branch).digest()
     #Generator is the generator we used to get our Schnorr
     #Public key and private key
     internal_pubkey = PublicKey(b'\x02' + control_block[1:33], raw=True)
-    scriptPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
+    calcedScriptPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
+    if(calcedScriptPubKey != scriptPubKey):
+        raise ValidationError("Script Public Key doesn't match spending scripts")
 
 def op_if():
     global witness_stack
@@ -428,7 +439,7 @@ def op_endif():
     #Remove the last value in execution stack
     exec_stack.pop()
 
-def process_script(msg):
+def process_script(msg, scriptPubKey):
     """
     Message is necessary input, as Bitcoin generates it from transaction data
     Since we generated the message from transaction data in the msg_hash function
@@ -458,12 +469,35 @@ def process_script(msg):
     #If there is no confirmation, raise an error
     if(not confirmation_stack):
         raise ValueError("No validation script ran")
+    #Confirm tweak confirms that our scriptPubKey matches our inputs
+    confirm_tweak(script, scriptPubKey)
     return confirmation_stack.pop()
 
-def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool: bool, script: str):
+def witness_verification(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool: bool, script_path_schnorr: str, script_path_dil: str, scriptPubKey):
     global witness_stack
+    #Follow Bitcoin's protocol for hashing leaf scripts
+    #Leaf version is 0xc0 as per BIP 341
+    leaf_ver = b'\xc0'
+    if script_path_bool == True:
+        revealed_script = script_path_schnorr
+        script_bytes = script_byte_format(script_path_dil)
+        tapleaf_hashed_script = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(script_bytes))+ script_bytes).digest()
+    else:
+        revealed_script = script_path_dil
+        script_bytes = script_byte_format(script_path_schnorr)
+        tapleaf_hashed_script = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(script_bytes))+ script_bytes).digest()
+    #Knowing our hashed script, we can recompute our tweaked pubkey
+    #Following Bitcoin protocol, we append the control block to the bottom of the stack
+    #Our script uses a NUMS public key to force script path spending
+    nums_pubkey_hex = "0000000000000000000000000000000000000000000000000000000000000001"
+
+    # Convert hex to bytes
+    nums_pubkey_bytes = bytes.fromhex(nums_pubkey_hex)
+    control_block = leaf_ver + nums_pubkey_bytes + tapleaf_hashed_script
+    witness_stack.append(control_block)
     #Generate the message and signatures
-    msg = msg_hash(proxy, amount, schnorr_public_key, dil_public_key, script)
+    #msg generated uing only the revealed script
+    msg = msg_hash(proxy, amount, schnorr_public_key, dil_public_key, revealed_script)
     schnorr_sig = sign(msg, schnorr_private_key)
     dil_sig = dilithium.Dilithium2.sign(dil_private_key, msg)
     #Witness stack executes on a LIFO basis, so the script goes in last and public key and 
@@ -474,30 +508,16 @@ def witness(proxy, amount, schnorr_public_key, dil_public_key, schnorr_private_k
     else:
         witness_stack.append(dil_public_key)
         witness_stack.append(dil_sig)
-    #Next, we append the boolean that determines which path our script takes
-    witness_stack.append(script_path_bool)
     #After, we append the script
-    witness_stack.append(script)
-    #Finally, we append the control block, which includes the leaf version, parity of y-coordinate,
-    #Schnorr x-only pubkey, and hashed script. This is used to verify our tweaked pubkey (scriptPubKey).
-    #Leaf version is 0xc0 as per BIP 341
-    temp_x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
-    temp_script_byte = script_byte_format(script)
-    leaf_version = 0xc0
-    control_block = bytes([leaf_version + (schnorr_public_key[1] % 2)]) + temp_x_only_pubkey + hashlib.sha256(bytes([leaf_version])+compact_size(len(temp_script_byte))+temp_script_byte).digest()
-    witness_stack.append(control_block)
-
+    witness_stack.append(revealed_script)
     #NOW, we execute everything on the witness stack in order
-    #Confirm tweak confirms that our scriptPubKey matches our inputs
-    confirm_tweak()
     #Process script processes all the opcodes in the script
-    validation = process_script(msg)
+    #In the process script function, we also confirm the tweak
+    validation = process_script(msg, scriptPubKey)
     if(validation):
         return validation
     else:
         raise ValidationError("Signature and Public Key do not match")
-
-
 
 
 def main():
@@ -517,16 +537,37 @@ def main():
     #Fund address 50 bitcoin
     fund(proxy, address, 1)
 
-    #We hard code our script used by the hybrid wallet
-    #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
+    #We hard code our scripts used by the hybrid wallet
     #Convert public keys to integers so split() function works properly on the string
-    script = f"OP_IF\n{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG\nOP_ELSE\n{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG\nOP_ENDIF"
+    #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
+    script_path_schnorr = f"{int.from_bytes(schnorr_to_xonly(schnorr_public_key), byteorder='little')} OP_CHECKSIG"
+    script_path_dil = f"{int.from_bytes(dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG"
+    
+    #Generate scriptPubKey following Bitcoin protocol
+    leaf_ver = b'\xc0'
+    schnorr_path_bytes = script_byte_format(script_path_schnorr)
+    schnorr_path_hash = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(schnorr_path_bytes))+ schnorr_path_bytes).digest()
+    dil_path_bytes = script_byte_format(script_path_dil)
+    dil_path_hash = hashlib.sha256((hashlib.sha256("TapLeaf".encode()).digest() * 2) +leaf_ver+compact_size(len(dil_path_bytes))+ dil_path_bytes).digest()
+    hashed_script_list = [schnorr_path_hash, dil_path_hash]
+    merkle_branch = (hashlib.sha256("TapBranch".encode()).digest() * 2)
+    for branch in sorted(hashed_script_list):
+        merkle_branch += branch
+    merkle_branch = hashlib.sha256(merkle_branch).digest()
+    # Use a NUMS pubkey to force script spending
+    NUMS_pubkey = bytes.fromhex("0000000000000000000000000000000000000000000000000000000000000001")
+    tweak = hashlib.sha256(hashlib.sha256("TapTweak".encode()).digest() + hashlib.sha256("TapTweak".encode()).digest() + NUMS_pubkey + merkle_branch).digest()
+    #Generator is the generator we used to get our Schnorr
+    #Public key and private key
+    internal_pubkey = PublicKey(b'\x02' + NUMS_pubkey, raw=True)
+    scriptPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
+
 
     #Script path boolean to determine which public and private key to use
     #True is Schnorr, False is Dilithium
     script_path_bool = False
     #Generate witness and run validation for the witness
-    if(witness(proxy, 1, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool, script)):
+    if(witness_verification(proxy, 1, schnorr_public_key, dil_public_key, schnorr_private_key, dil_private_key, script_path_bool, script_path_schnorr, script_path_dil, scriptPubKey)):
         if (script_path_bool):
             print("Schnorr signature validation successful!")
         else:
