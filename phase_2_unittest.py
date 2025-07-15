@@ -21,7 +21,7 @@ class TestPhaseOne(unittest.TestCase):
         #See if the x-values are equal, y-values of dsa.gen_keys() is not guaranteed to be even
         #Unlike the y-values of x_only_to_schnorr(x_only)
         self.assertEqual(schnorr_public_key[0], reverted_x_only[0])
-
+    
     #Test the pubkey extraction from a tapscript
     def test_pubkey_extraction(self):
         #Simple tapscript and simple extraction test
@@ -30,7 +30,7 @@ class TestPhaseOne(unittest.TestCase):
         expected_simple_output = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
         self.assertEqual(pubkeys_found, expected_simple_output)
 
-        # Example my tapscript
+        # Example my tapscript with both Dilithium and Schnorr keys
         schnorr_private_key, schnorr_public_key = dsa.gen_keys()
         x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
         #Dilithum keys generated as byte strings
@@ -43,6 +43,32 @@ class TestPhaseOne(unittest.TestCase):
         expected_my_output = [x_only_pubkey.hex()]
         self.assertEqual(pubkeys_found_myscript, expected_my_output)
     
+    #Test our function to pull out all past previous pubkeys
+    #WARNING: Takes a long time if there are a lot of blocks
+    def test_get_previous_pubkeys(self):
+        #Generates 2*number revealed addresses
+        number = 10
+        revealed_pubkey_checklist = []
+        for i in range(number):
+            receiver_address = proxy.getnewaddress()
+            amount_to_send = 1
+            txid = proxy.sendtoaddress(receiver_address, amount_to_send)
+            # Mine a block to confirm transaction (only necessary for regtest)
+            proxy.generatetoaddress(1, proxy.getnewaddress())
+            # Get transaction info
+            transaction_info = proxy.gettransaction(txid)
+            # Get the raw hex
+            raw_hex = transaction_info['hex']
+            # Decode the raw transaction
+            transaction_decoded = proxy.decoderawtransaction(raw_hex)
+            # Add the first generated vin to the checklist
+            revealed_pubkey_checklist.append(transaction_decoded['vin'][0]['txinwitness'][1])
+        
+        get_previous_pubkeys()
+
+        for pubkey in revealed_pubkey_checklist:
+            self.assertTrue(pubkey in revealed_p2tr_pubkeys)
+
     #Test if I am getting committed op_returns with proper formatting
     #Also test and see if the commit is not occuring with incorrect format
     def test_op_return_commits(self):
@@ -238,6 +264,33 @@ class TestPhaseOne(unittest.TestCase):
         #Using random schnorr public key and target address inputs
         #To show that Dilithium spending is not linked to the Schnorr side
         self.assertTrue(witness_verification(1, schnorr_public_key, dil_public_key, unsafe_schnorr_public_key, dil_private_key, script_path_bool, script_path_schnorr, script_path_dil, scriptPubKey))
+
+    #Test if my new P2DIL address type has proper transaction information
+    #We use P2TR format as a base but with a P2WPKH scriptcode format, twinwitness format, and scriptPubKey format
+    def test_p2dil_address(self):
+        receiver_address = proxy.getnewaddress("", "bech32m")
+        amount_to_send = 0.589
+        txid = proxy.sendtoaddress(receiver_address, amount_to_send)
+
+        #Confirm transaction by mining some blocks
+        mine_to_confirm = 1
+        proxy.generatetoaddress(mine_to_confirm, receiver_address)
+
+        #Find transaction info
+        transaction_info = proxy.gettransaction(txid)
+
+        # Get the raw hex
+        raw_hex = transaction_info['hex']
+
+        # Decode the raw transaction
+        decoded = proxy.decoderawtransaction(raw_hex)
+
+        # Use function to get new transaction info format
+        new_transaction_info, signed_msg_list = p2dil_transaction_info_format(amount_to_send, decoded)
+
+        #Test that the updated txinwitness is a verifiable Dilithium public key and signature
+        for i in range(len(new_transaction_info['vin'])):
+            self.assertTrue(dilithium.Dilithium2.verify(bytes.fromhex(new_transaction_info['vin'][i]['txinwitness'][1]), signed_msg_list[i], bytes.fromhex(new_transaction_info['vin'][i]['txinwitness'][0])))
 
 
 if __name__ == '__main__':

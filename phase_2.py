@@ -130,6 +130,12 @@ def script_byte_format(script: str):
             script_byte_list.append(b'\xc0')
         elif item == "OP_ENDIF":
             script_byte_list.append(b'\x68')
+        elif item == "OP_DUP":
+            script_byte_list.append(b'\x76')
+        elif item == "OP_EQUALVERIFY":
+            script_byte_list.append(b'\x88')
+        elif item == "OP_HASH256":
+            script_byte_list.append(b'\xaa')
         #If byte count is less than 75, we use no OP_PUSHDATA
         #After checking if it is an opcode, we are certain the item is a public key
         elif len(item) < 75 and isinstance(item, bytes):
@@ -171,7 +177,7 @@ def tweak_pubkey(script_list:list) -> bytes:
     tweakedPubKey = internal_pubkey.tweak_add(tweak).serialize()[1:]
     return tweakedPubKey
 
-def msg_hash(amount_spent: float, schnorr_public_key, dil_public_key, script):
+def msg_hash(amount_spent: float, script:str):
     """
     Creates a message hash for our transaction using information from fabricated transactions
     amount_spent: the amount we are spending in BTC
@@ -246,7 +252,6 @@ def msg_hash(amount_spent: float, schnorr_public_key, dil_public_key, script):
 
     #We hard code the script to match Bitcoin Opcode protocol
     #And to match the hybrid script we wish to create
-    x_only_pubkey = schnorr_to_xonly(schnorr_public_key)
     script = script_byte_format(script)
     tapleaf_hash = hashlib.sha256(bytes([leaf_version]) + compact_size(len(script)) +script).digest()
     
@@ -480,7 +485,7 @@ def witness_verification(amount, schnorr_public_key, dil_public_key, target_addr
     witness_stack.append(control_block)
     #Generate the message and signatures
     #msg generated uing only the revealed script
-    msg = msg_hash(amount, schnorr_public_key, dil_public_key, revealed_script)
+    msg = msg_hash(amount, revealed_script)
     dil_sig = dilithium.Dilithium2.sign(dil_private_key, msg)
     #Witness stack executes on a LIFO basis, so the script goes in last and public key and 
     #signature goes in first
@@ -575,63 +580,54 @@ def get_previous_pubkeys():
                 for pubkey in temp_pubkey_list:
                     revealed_p2tr_pubkeys.add(pubkey)
 
+def p2dil_transaction_info_format(amount_to_send:float, decoded):
+    dil_msg_list = []
+    for vin in decoded['vin']:
+        dil_public_key, dil_private_key = dilithium.Dilithium2.keygen()
+        #Copied scriptcode's structure from P2WPKH
+        p2dil_scriptcode = f"OP_DUP OP_HASH256 {int.from_bytes(double_sha256(dil_public_key), byteorder='little')} OP_EQUALVERIFY OP_CHECKDILITHIUMSIG"
+        #Cut the amount into smaller bits to simulate multiple UTXOs
+        amount = round(amount_to_send/len(vin), 7)
+        dil_msg = msg_hash(amount, p2dil_scriptcode)
+        dil_sig = dilithium.Dilithium2.sign(dil_private_key, dil_msg)
+
+        #Add items into txinwitness, converted to hex
+        #In Bitcoin protocol, earlier items are on top of the stack
+        add_list = [dil_sig.hex(), dil_public_key.hex()]
+        vin['txinwitness'] = add_list
+        dil_msg_list.append(dil_msg)
+    
+    dil_vout_list = []
+    for vout in decoded['vout']:
+        reciever_dil_public_key, reciever_dil_private_key = dilithium.Dilithium2.keygen()
+        new_scriptPubKey_section = {'hex' : double_sha256(reciever_dil_public_key).hex(), 'type':'witness_v1_dilithium'}
+        vout['scriptPubKey'] = new_scriptPubKey_section
+        dil_vout_list.append(new_scriptPubKey_section)
+    
+    return decoded, dil_msg_list
 
 def main():
-    # receiver_address = proxy.getnewaddress("", "bech32m")
-    # amount_to_send = 0.589
-    # txid = proxy.sendtoaddress(receiver_address, amount_to_send)
+    receiver_address = proxy.getnewaddress("", "bech32m")
+    amount_to_send = 0.589
+    txid = proxy.sendtoaddress(receiver_address, amount_to_send)
 
-    # #Confirm transaction by mining some blocks
-    # mine_to_confirm = 1
-    # proxy.generatetoaddress(mine_to_confirm, receiver_address)
+    #Confirm transaction by mining some blocks
+    mine_to_confirm = 1
+    proxy.generatetoaddress(mine_to_confirm, receiver_address)
 
-    # #Find transaction info
-    # transaction_info = proxy.gettransaction(txid)
-    # print(transaction_info)
+    #Find transaction info
+    transaction_info = proxy.gettransaction(txid)
 
-    # # Get the raw hex
-    # raw_hex = transaction_info['hex']
+    # Get the raw hex
+    raw_hex = transaction_info['hex']
 
-    # # Decode the raw transaction
-    # decoded = proxy.decoderawtransaction(raw_hex)
+    # Decode the raw transaction
+    decoded = proxy.decoderawtransaction(raw_hex)
     # print(decoded)
-
-    schnorr_private_key_new, schnorr_public_key_new = dsa.gen_keys()
-
-    #Dilithum keys generated as byte strings
-    dil_public_key_new, dil_private_key_new = dilithium.Dilithium2.keygen()
-
-    #Generate new taproot address
-    address_new = proxy.getnewaddress("", "bech32m")
-
-    #Fund address 50 bitcoin
-    fund(address_new, 1)
-
-    #We hard code our script used by the hybrid wallet
-    #Hypothetical opcode byte for OP_CHECKDILITHIUMSIG is b'\xc0', which is one of the unassigned opcode bytes
-    #Convert public keys to integers so split() function works properly on the string
-    script_path_schnorr_new = f"{int.from_bytes(schnorr_to_xonly(schnorr_public_key_new), byteorder='little')} OP_CHECKSIG"
-    script_path_dil_new = f"{int.from_bytes(dil_public_key_new, byteorder='little')} OP_CHECKDILITHIUMSIG"
-
-    scriptPubKey_new = tweak_pubkey([script_path_schnorr_new, script_path_dil_new])
-    # Make the generated address the unsafe address we transfer coins away from
-    unsafe_schnorr_public_key_new = bytes.fromhex(proxy.getaddressinfo(address_new)['witness_program'])
-    protocol_ID = b'\x43\x44\x52\x50'
-    version = 1
-    #Opreturn example for hybrid script
-    script_opreturn_hybrid_new = f"OP_RETURN {protocol_ID} {version} {int.from_bytes(hashlib.sha256(unsafe_schnorr_public_key_new + hashlib.sha256(tweak_pubkey([script_path_schnorr_new, script_path_dil_new])).digest()).digest())}"
-
-    #Commit unsafe public key
-    witness_opreturn(script_opreturn_hybrid_new)
-
-    #Fund address 50 bitcoin
-    #This mines 101 blocks, easily enough to confirm the op_return
-    fund(address_new, 1)
-
-    #Should succeed because of mined blocks
-    unsafe_schnorr_public_key_new = x_only_to_schnorr(unsafe_schnorr_public_key_new)
-    script_path_bool_new = True
-    print(witness_verification(1, unsafe_schnorr_public_key_new, dil_public_key_new, tweak_pubkey([script_path_schnorr_new, script_path_dil_new]), dil_private_key_new, script_path_bool_new, script_path_schnorr_new, script_path_dil_new, scriptPubKey_new))
+    decoded = p2dil_transaction_info_format(amount_to_send,decoded)
+    
+    print(decoded)
+    
 
     #TODO: Phase 2 would need a new way of calculating scriptPubKey or just not at all,
     # as we can't just tweak the public key anymore bcs Dilithium2 pub keys are too long
