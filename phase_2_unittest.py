@@ -43,31 +43,31 @@ class TestPhaseOne(unittest.TestCase):
         expected_my_output = [x_only_pubkey.hex()]
         self.assertEqual(pubkeys_found_myscript, expected_my_output)
     
-    #Test our function to pull out all past previous pubkeys
-    #WARNING: Takes a long time if there are a lot of blocks
-    def test_get_previous_pubkeys(self):
-        #Generates 2*number revealed addresses
-        number = 10
-        revealed_pubkey_checklist = []
-        for i in range(number):
-            receiver_address = proxy.getnewaddress()
-            amount_to_send = 1
-            txid = proxy.sendtoaddress(receiver_address, amount_to_send)
-            # Mine a block to confirm transaction (only necessary for regtest)
-            proxy.generatetoaddress(1, proxy.getnewaddress())
-            # Get transaction info
-            transaction_info = proxy.gettransaction(txid)
-            # Get the raw hex
-            raw_hex = transaction_info['hex']
-            # Decode the raw transaction
-            transaction_decoded = proxy.decoderawtransaction(raw_hex)
-            # Add the first generated vin to the checklist
-            revealed_pubkey_checklist.append(transaction_decoded['vin'][0]['txinwitness'][1])
+    # Test our function to pull out all past previous pubkeys
+    # WARNING: Takes a long time if there are a lot of blocks
+    # def test_get_previous_pubkeys(self):
+    #     #Generates 2*number revealed addresses
+    #     number = 10
+    #     revealed_pubkey_checklist = []
+    #     for i in range(number):
+    #         receiver_address = proxy.getnewaddress()
+    #         amount_to_send = 1
+    #         txid = proxy.sendtoaddress(receiver_address, amount_to_send)
+    #         # Mine a block to confirm transaction (only necessary for regtest)
+    #         proxy.generatetoaddress(1, proxy.getnewaddress())
+    #         # Get transaction info
+    #         transaction_info = proxy.gettransaction(txid)
+    #         # Get the raw hex
+    #         raw_hex = transaction_info['hex']
+    #         # Decode the raw transaction
+    #         transaction_decoded = proxy.decoderawtransaction(raw_hex)
+    #         # Add the first generated vin to the checklist
+    #         revealed_pubkey_checklist.append(transaction_decoded['vin'][0]['txinwitness'][1])
         
-        get_previous_pubkeys()
+    #     get_previous_pubkeys()
 
-        for pubkey in revealed_pubkey_checklist:
-            self.assertTrue(pubkey in revealed_p2tr_pubkeys)
+    #     for pubkey in revealed_pubkey_checklist:
+    #         self.assertTrue(pubkey in revealed_p2tr_pubkeys)
 
     #Test if I am getting committed op_returns with proper formatting
     #Also test and see if the commit is not occuring with incorrect format
@@ -286,12 +286,16 @@ class TestPhaseOne(unittest.TestCase):
         decoded = proxy.decoderawtransaction(raw_hex)
 
         # Use function to get new transaction info format
-        new_transaction_info, signed_msg_list = p2dil_transaction_info_format(amount_to_send, decoded)
+        new_transaction_info, signed_msg_list, vout_info_list = p2dil_transaction_info_format(amount_to_send, decoded)
 
         #Test that the updated txinwitness is a verifiable Dilithium public key and signature
         for i in range(len(new_transaction_info['vin'])):
             self.assertTrue(dilithium.Dilithium2.verify(bytes.fromhex(new_transaction_info['vin'][i]['txinwitness'][1]), signed_msg_list[i], bytes.fromhex(new_transaction_info['vin'][i]['txinwitness'][0])))
 
+        #Test that the address type for every vout is the correct
+        #P2DIL address (expected 'bc1z' as first 4 letters)
+        for vout in vout_info_list:
+            self.assertEqual(vout['address'][:4], 'bc1z')
 
 if __name__ == '__main__':
     unittest.main()

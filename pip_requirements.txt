@@ -5,3 +5,4 @@ python-bitcoinlib
 bitcoinlib
 secp256k1
 coincurve
+bech32

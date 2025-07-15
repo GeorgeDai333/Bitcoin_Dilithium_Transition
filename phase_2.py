@@ -7,6 +7,7 @@
 # !brew install secp256k1
 # !pip install secp256k1
 # !pip install coincurve
+# !pip install bech32
 
 from multiprocessing import Value
 from bitcoin.core import ValidationError
@@ -22,6 +23,7 @@ import struct
 import binascii
 from dilithium_py import dilithium
 from secp256k1 import PublicKey
+from bech32 import bech32_encode, convertbits, bech32_decode
 
 #global proxy
 rpc_url = 'http://joshuageorgedai:333777000@127.0.0.1:18443/wallet/myaddress'
@@ -600,11 +602,24 @@ def p2dil_transaction_info_format(amount_to_send:float, decoded):
     dil_vout_list = []
     for vout in decoded['vout']:
         reciever_dil_public_key, reciever_dil_private_key = dilithium.Dilithium2.keygen()
-        new_scriptPubKey_section = {'hex' : double_sha256(reciever_dil_public_key).hex(), 'type':'witness_v1_dilithium'}
+        hashed_dil_pubkey = double_sha256(reciever_dil_public_key)
+        hrp = "bc"
+        # Change witness verion to v2 for our P2DIL address type
+        # Differentiating it from Taproot (v1) and SegWit (v0)
+        # Header should be 'bc1z', as this is version 2
+        witness_version = 2
+        witness_program = hashed_dil_pubkey
+
+        # Convert witness program bytes from 8-bit to 5-bit groups
+        data = [witness_version] + convertbits(witness_program, 8, 5)
+        address = bech32_encode(hrp, data)
+
+
+        new_scriptPubKey_section = {'hex' : hashed_dil_pubkey.hex(), 'address':address, 'type':'witness_v1_dilithium'}
         vout['scriptPubKey'] = new_scriptPubKey_section
         dil_vout_list.append(new_scriptPubKey_section)
     
-    return decoded, dil_msg_list
+    return decoded, dil_msg_list, dil_vout_list
 
 def main():
     receiver_address = proxy.getnewaddress("", "bech32m")
@@ -623,8 +638,6 @@ def main():
 
     # Decode the raw transaction
     decoded = proxy.decoderawtransaction(raw_hex)
-    # print(decoded)
-    decoded = p2dil_transaction_info_format(amount_to_send,decoded)
     
     print(decoded)
     
