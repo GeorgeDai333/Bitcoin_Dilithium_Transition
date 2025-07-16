@@ -439,6 +439,7 @@ def process_script(msg, scriptPubKey):
     confirm_tweak(script, scriptPubKey)
     return confirmation_stack.pop()
 
+#This is intended as an extension of current OP_RETURN functionality
 def op_return(script_list):
     """
     Don't forget, everything in script list is a string
@@ -447,11 +448,9 @@ def op_return(script_list):
     global committed_opreturns
     global proxy
 
-    if (not witness_stack):
-        raise ValueError("Witness stack is empty (process_opreturn_script)")
-
     #Define acceptable conditions and add to committed list
     accepted_versions = ["1"]
+    #Protocol_ID is CDRP in bytes
     designated_protocol_ID = b'\x43\x44\x52\x50'
     if (script_list[0] == "OP_RETURN"):
         if len(script_list) == 4 and (script_list[1] == f"{designated_protocol_ID}" and script_list[2] in accepted_versions):

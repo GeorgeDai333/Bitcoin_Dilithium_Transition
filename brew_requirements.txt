@@ -1,3 +1,4 @@
 #Dependencies
+bitcoin
 pkg-config
 secp256k1

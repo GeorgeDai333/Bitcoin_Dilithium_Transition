@@ -1,41 +1,80 @@
-License: No License as of now. Thus, all rights as reserved for the owner.
+# Bitcoin Core with Dilithium Signatures Implementation Notes
 
-NOTE: To run the program and tests, the user needs to download Bitcoin Core from GitHub at https://github.com/bitcoin/bitcoin.
+**License**: No license specified. All rights reserved for the owner.
 
-After the download, edit the ./src/kernel/chainparams.cpp file, changing consensus.nSubsidyHalvingInterval to 210000 from 150.
+## Setup Instructions
 
-Then, run the following commands in the Bitcoin folder to build Bitcoin Core
-rm -rf build
-mkdir build
-cd build
-cmake ..
-cmake --build . -- -j$(sysctl -n hw.ncpu)
-cd build
+To run the program and tests, follow these steps to set up Bitcoin Core with the necessary modifications:
 
-Finally, run these commands to activate Bitcoin Core and create the wallet
-bitcoind -regtest -daemon -rpcuser=joshuageorgedai -rpcpassword=333777000 -rpcport=18443
-bitcoin-cli -regtest -rpcuser=joshuageorgedai -rpcpassword=333777000 createwallet myaddress
+1. **Download Bitcoin Core**:
+   - Obtain the Bitcoin Core source code from [GitHub](https://github.com/bitcoin/bitcoin).
 
-If the user wants to stop Bitcoin Core, run
-bitcoin-cli -regtest -rpcuser=joshuageorgedai -rpcpassword=333777000 stop
-reactivate using the commands in the previous paragraph
+2. **Modify Chain Parameters**:
+   - Edit the file `./src/kernel/chainparams.cpp`.
+   - Change `consensus.nSubsidyHalvingInterval` from `150` to `210000`.
 
-This is not a perfect implementation of Bitcoin, but it serves as an illustration for the ideas the implementation of Dilithium signatures mentioned in my paper.
-[everything else negative here]
+3. **Build Bitcoin Core**:
+   - Navigate to the Bitcoin Core folder and execute the following commands:
+     ```bash
+     rm -rf build
+     mkdir build
+     cd build
+     cmake ..
+     cmake --build . -- -j$(sysctl -n hw.ncpu)
+     cd build
+     ```
 
-For example, some advantages provided by Schnorr signatures would be lost, such as signature aggregation for multisignature structures. Needless to say, the signatures for Dilithium are much larger, meaning almost everything needs to be larger. Also, the interaction between Dilithium2 encryption and layer 2 solutions (such as the lightning network) still needs to be studied.
+4. **Activate Bitcoin Core and Create Wallet**:
+   - Run the following commands to start Bitcoin Core in regtest mode and create a wallet:
+     ```bash
+     bitcoind -regtest -daemon -rpcuser=joshuageorgedai -rpcpassword=333777000 -rpcport=18443
+     bitcoin-cli -regtest -rpcuser=joshuageorgedai -rpcpassword=333777000 createwallet myaddress
+     ```
 
-Below, I list the discrepencies of my code's functionalities to real Bitcoin code, as well as why these functional differences are acceptable:
-- Phase 1: The vout scriptPubKeys from the bitcoin chain are not generated with my custom script (should be acceptable because an arbitrary scriptPubKey is no different from a specific one when I am implementing the hybrid wallet and OP_CHECKDILITHIUMSIG)
+5. **Stopping Bitcoin Core**:
+   - To stop Bitcoin Core, use:
+     ```bash
+     bitcoin-cli -regtest -rpcuser=joshuageorgedai -rpcpassword=333777000 stop
+     ```
+   - To reactivate, repeat the activation commands from step 4.
 
-- Phase 1: I don't have the OP_PUSHDATA2 opcode in my script. However, I do represent that opcode whenever I need to push a very large object (such as the Dilithium2 signature).
+## Implementation Notes
 
-- Phase 1: dsa.genkeys() is not guaranteed to have an even y-value for the public key. (This is acceptable because my equations don't excessively depend on the parity of the y-value of the Schnorr public key)
+This implementation is not a complete replication of Bitcoin but serves as a proof-of-concept for integrating Dilithium signatures, as described in the referenced paper. Below are key considerations and trade-offs:
 
-- Phase 1: My program is not reading my byte script when decoding the script's opcodes. (This level of abstraction is acceptable, as it is unnecessary to read the script in bytes when I already have the script in opcode format)
+### Limitations Compared to Schnorr Signatures
+- **Loss of Signature Aggregation**: Unlike Schnorr signatures, Dilithium signatures do not support signature aggregation for multisignature structures, which may impact efficiency in certain use cases.
+- **Larger Signature Size**: Dilithium signatures are significantly larger, requiring larger data structures throughout the system.
+- **Layer 2 Compatibility**: The interaction between Dilithium2 encryption and layer 2 solutions (e.g., Lightning Network) requires further research.
 
-- Phase 1: My tweaked public keys are not stored on-chain. (Acceptable because, in a real Bitcoin chain, the tweaked public keys would be stored on-chain)
+## Functional Discrepancies (Phase 1)
 
-EXTERNAL CHANGES FOR PHASE 2:
+The following differences exist between this implementation and standard Bitcoin functionality, with justifications for their acceptability:
 
-While I couldn't directly edit Bitcoin source code with my python code, I have located the line of code that dictates maximum block weight. In Bitcoin source code's consensus/consensus.h file, there is a variable called MAX_BLOCK_WEIGHT, which is set to 4000000. To implement my phase 2's change of increasing block weight by 17 times, I would simply set that variable to 68000000.
+- **ScriptPubKey Generation**:
+  - **Discrepancy**: The `vout` scriptPubKeys from the Bitcoin chain are not generated using the custom script.
+  - **Justification**: An arbitrary scriptPubKey is functionally equivalent to a specific one when implementing the hybrid wallet and `OP_CHECKDILITHIUMSIG`.
+
+- **OP_PUSHDATA2 Opcode**:
+  - **Discrepancy**: The `OP_PUSHDATA2` opcode is not explicitly included in the script but is represented when pushing large objects, such as Dilithium2 signatures.
+  - **Justification**: This abstraction is sufficient for handling large data pushes in the context of this implementation.
+
+- **Public Key Y-Value Parity**:
+  - **Discrepancy**: The `dsa.genkeys()` function does not guarantee an even y-value for the public key.
+  - **Justification**: The equations used do not heavily rely on the parity of the y-value of the Schnorr public key, making this acceptable.
+
+- **Script Opcode Decoding**:
+  - **Discrepancy**: The program does not read the script in byte format when decoding opcodes.
+  - **Justification**: Since the script is already available in opcode format, reading it in bytes is unnecessary for this level of abstraction.
+
+- **Tweaked Public Keys Storage**:
+  - **Discrepancy**: Tweaked public keys are not stored on-chain in this implementation.
+  - **Justification**: In a production Bitcoin chain, tweaked public keys would be stored on-chain, so this omission is acceptable for demonstration purposes.
+
+## Proposed Changes for Phase 2
+
+To accommodate the increased data requirements of Dilithium signatures, the maximum block weight must be adjusted:
+
+- **Location**: In the Bitcoin source code, the file `consensus/consensus.h` contains the variable `MAX_BLOCK_WEIGHT`, currently set to `4000000`.
+- **Proposed Change**: Increase `MAX_BLOCK_WEIGHT` to `68000000` (17 times the original value) to support Phase 2 requirements.
+- **Note**: Direct modification of the Bitcoin source code was not performed in this implementation, but the above change would enable the necessary block weight increase.

@@ -95,6 +95,7 @@ class TestPhaseOne(unittest.TestCase):
 
         scriptPubKey = tweak_pubkey([script_path_schnorr, script_path_dil])
 
+        #Protocol_ID is CDRP in bytes
         protocol_ID = b'\x43\x44\x52\x50'
         version = 1
         # Make the generated address the unsafe address we transfer coins away from
@@ -123,6 +124,7 @@ class TestPhaseOne(unittest.TestCase):
         #Test if the wrong version records as a commit
         wrong_address = proxy.getnewaddress("", "bech32m")
         wrong_unsafe_schnorr_public_key = bytes.fromhex(proxy.getaddressinfo(wrong_address)['witness_program'])
+        #Protocol_ID is CDRP in bytes
         protocol_ID = b'\x43\x44\x52\x50'
         wrong_version = 10
         wrong_script_opreturn_hybrid = f"OP_RETURN {protocol_ID} {wrong_version} {int.from_bytes(hashlib.sha256(wrong_unsafe_schnorr_public_key + hashlib.sha256(scriptPubKey).digest()).digest())}"
@@ -163,6 +165,7 @@ class TestPhaseOne(unittest.TestCase):
         self.assertFalse(witness_verification(1, unsafe_schnorr_public_key, dil_public_key, scriptPubKey, dil_private_key, script_path_bool, script_path_schnorr, script_path_dil, scriptPubKey))
 
         #TRANSACTION WITH OP_RETURN BUT NO CONFIRMATION TEST
+        #Protocol_ID is CDRP in bytes
         protocol_ID = b'\x43\x44\x52\x50'
         version = 1
         #Opreturn example for hybrid script
