@@ -200,7 +200,7 @@ def msg_hash(amount_spent: float, script:str):
     #Generate a fake transaction to use for our txid info
     #We can do this without loss of generality because we assume that
     #Our transaction data and previous transaction data would be random in a real Bitcoin chain
-    receiver_address = proxy.getnewaddress()
+    receiver_address = proxy.getnewaddress("", "bech32m")
     amount_to_send = amount_spent
     txid = proxy.sendtoaddress(receiver_address, amount_to_send)
     # Mine a block to confirm transaction (only necessary for regtest)
@@ -427,6 +427,8 @@ def process_script(msg, scriptPubKey):
             confirmation_stack.append(op_checkdilithiumsig(msg))
         elif item == "OP_ENDIF":
             op_endif()
+        elif item == "OP_RETURN":
+            confirmation_stack.append(op_return(script_list))
     
     #Clear confirmation stack of all None return values
     confirmation_stack = [item for item in confirmation_stack if item is not None]
@@ -437,7 +439,7 @@ def process_script(msg, scriptPubKey):
     confirm_tweak(script, scriptPubKey)
     return confirmation_stack.pop()
 
-def process_opreturn_script():
+def op_return(script_list):
     """
     Don't forget, everything in script list is a string
     """
@@ -447,8 +449,6 @@ def process_opreturn_script():
 
     if (not witness_stack):
         raise ValueError("Witness stack is empty (process_opreturn_script)")
-    script = witness_stack.pop()
-    script_list = script.split()
 
     #Define acceptable conditions and add to committed list
     accepted_versions = ["1"]
@@ -458,6 +458,9 @@ def process_opreturn_script():
             committed_opreturns[int(script_list[3]).to_bytes(32, 'little')] = proxy.getblockchaininfo()['blocks']
     else:
         raise ValueError("Not an OP_RETURN (process_opreturn_script)")
+    #Clear witness stack as OP_RETURN should leave nothing on the stack except the control block
+    witness_stack[1:] = []
+    return True
 
 def witness_verification(amount, schnorr_public_key, dil_public_key, target_address, dil_private_key, script_path_bool: bool, script_path_schnorr: str, script_path_dil: str, scriptPubKey):
     """
@@ -505,11 +508,6 @@ def witness_verification(amount, schnorr_public_key, dil_public_key, target_addr
     #Process script processes all the opcodes in the script
     validation = process_script(msg, scriptPubKey)
     return validation
-
-def witness_opreturn(script):
-    global witness_stack
-    witness_stack.append(script)
-    process_opreturn_script()
 
 def extract_schnorr_pubkeys(tapscript_hex) -> list:
     pubkeys = []
@@ -569,9 +567,11 @@ def get_previous_pubkeys():
                     continue
                 input_list = vin["txinwitness"]
                 
-
-                #Check base case (no script)
-                if len(input_list) == 2:
+                #Check if it is a P2TR key spend path
+                if len(input_list) == 1:
+                    revealed_p2tr_pubkeys.add(input_list[0])
+                #Check SegWit case (no script)
+                elif len(input_list) == 2:
                     #Second value is the Schnorr public key
                     revealed_p2tr_pubkeys.add(input_list[1])
                 elif len(input_list) > 2:
@@ -622,24 +622,27 @@ def p2dil_transaction_info_format(amount_to_send:float, decoded):
     return decoded, dil_msg_list, dil_vout_list
 
 def main():
-    receiver_address = proxy.getnewaddress("", "bech32m")
-    amount_to_send = 0.589
-    txid = proxy.sendtoaddress(receiver_address, amount_to_send)
+    number = 10
+    revealed_pubkey_checklist = []
+    for i in range(number):
+        receiver_address = proxy.getnewaddress("", "bech32m")
+        amount_to_send = 1
+        txid = proxy.sendtoaddress(receiver_address, amount_to_send)
+        # Mine a block to confirm transaction (only necessary for regtest)
+        proxy.generatetoaddress(1, proxy.getnewaddress())
+        # Get transaction info
+        transaction_info = proxy.gettransaction(txid)
+        # Get the raw hex
+        raw_hex = transaction_info['hex']
+        # Decode the raw transaction
+        transaction_decoded = proxy.decoderawtransaction(raw_hex)
+        # Add the first generated vin to the checklist
+        revealed_pubkey_checklist.append(transaction_decoded['vin'][0]['txinwitness'][0])
 
-    #Confirm transaction by mining some blocks
-    mine_to_confirm = 1
-    proxy.generatetoaddress(mine_to_confirm, receiver_address)
+    get_previous_pubkeys()
 
-    #Find transaction info
-    transaction_info = proxy.gettransaction(txid)
-
-    # Get the raw hex
-    raw_hex = transaction_info['hex']
-
-    # Decode the raw transaction
-    decoded = proxy.decoderawtransaction(raw_hex)
-    
-    print(decoded)
+    for pubkey in revealed_pubkey_checklist:
+        print(pubkey in revealed_p2tr_pubkeys)
     
 
     #TODO: Phase 2 would need a new way of calculating scriptPubKey or just not at all,

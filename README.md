@@ -36,3 +36,6 @@ Below, I list the discrepencies of my code's functionalities to real Bitcoin cod
 
 - Phase 1: My tweaked public keys are not stored on-chain. (Acceptable because, in a real Bitcoin chain, the tweaked public keys would be stored on-chain)
 
+EXTERNAL CHANGES FOR PHASE 2:
+
+While I couldn't directly edit Bitcoin source code with my python code, I have located the line of code that dictates maximum block weight. In Bitcoin source code's consensus/consensus.h file, there is a variable called MAX_BLOCK_WEIGHT, which is set to 4000000. To implement my phase 2's change of increasing block weight by 17 times, I would simply set that variable to 68000000.

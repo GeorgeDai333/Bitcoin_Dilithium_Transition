@@ -45,29 +45,30 @@ class TestPhaseOne(unittest.TestCase):
     
     # Test our function to pull out all past previous pubkeys
     # WARNING: Takes a long time if there are a lot of blocks
-    # def test_get_previous_pubkeys(self):
-    #     #Generates 2*number revealed addresses
-    #     number = 10
-    #     revealed_pubkey_checklist = []
-    #     for i in range(number):
-    #         receiver_address = proxy.getnewaddress()
-    #         amount_to_send = 1
-    #         txid = proxy.sendtoaddress(receiver_address, amount_to_send)
-    #         # Mine a block to confirm transaction (only necessary for regtest)
-    #         proxy.generatetoaddress(1, proxy.getnewaddress())
-    #         # Get transaction info
-    #         transaction_info = proxy.gettransaction(txid)
-    #         # Get the raw hex
-    #         raw_hex = transaction_info['hex']
-    #         # Decode the raw transaction
-    #         transaction_decoded = proxy.decoderawtransaction(raw_hex)
-    #         # Add the first generated vin to the checklist
-    #         revealed_pubkey_checklist.append(transaction_decoded['vin'][0]['txinwitness'][1])
+    def test_get_previous_pubkeys(self):
+        #Generates 2*number revealed addresses
+        number = 10
+        revealed_pubkey_checklist = []
+        for i in range(number):
+            receiver_address = proxy.getnewaddress("", "bech32m")
+            amount_to_send = 1
+            txid = proxy.sendtoaddress(receiver_address, amount_to_send)
+            # Mine a block to confirm transaction (only necessary for regtest)
+            proxy.generatetoaddress(1, proxy.getnewaddress())
+            # Get transaction info
+            transaction_info = proxy.gettransaction(txid)
+            # Get the raw hex
+            raw_hex = transaction_info['hex']
+            # Decode the raw transaction
+            transaction_decoded = proxy.decoderawtransaction(raw_hex)
+            # Add the first generated vin to the checklist
+            # Take the first item in txinwitness because this is a key-path spend
+            revealed_pubkey_checklist.append(transaction_decoded['vin'][0]['txinwitness'][0])
         
-    #     get_previous_pubkeys()
+        get_previous_pubkeys()
 
-    #     for pubkey in revealed_pubkey_checklist:
-    #         self.assertTrue(pubkey in revealed_p2tr_pubkeys)
+        for pubkey in revealed_pubkey_checklist:
+            self.assertTrue(pubkey in revealed_p2tr_pubkeys)
 
     #Test if I am getting committed op_returns with proper formatting
     #Also test and see if the commit is not occuring with incorrect format
@@ -101,7 +102,12 @@ class TestPhaseOne(unittest.TestCase):
 
         script_opreturn_hybrid = f"OP_RETURN {protocol_ID} {version} {int.from_bytes(hashlib.sha256(unsafe_schnorr_public_key + hashlib.sha256(scriptPubKey).digest()).digest())}"
 
-        witness_opreturn(script_opreturn_hybrid)
+        burned_schnorr_private_key, burned_schnorr_public_key = dsa.gen_keys()
+        burned_dil_public_key, burned_dil_private_key = dilithium.Dilithium2.keygen()
+        burned_script_path_dil = f"{int.from_bytes(burned_dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG"
+        burned_scriptPubKey = tweak_pubkey([script_opreturn_hybrid, burned_script_path_dil])
+        #This witness verification commits the opcode
+        witness_verification(1, burned_schnorr_public_key, burned_dil_public_key, burned_scriptPubKey, burned_dil_private_key, True, script_opreturn_hybrid, burned_script_path_dil, burned_scriptPubKey)
         #See if the hashed value is in the list of committed values
         self.assertTrue(hashlib.sha256(unsafe_schnorr_public_key + hashlib.sha256(scriptPubKey).digest()).digest()[::-1] in committed_opreturns)
 
@@ -110,7 +116,8 @@ class TestPhaseOne(unittest.TestCase):
         wrong_unsafe_schnorr_public_key = bytes.fromhex(proxy.getaddressinfo(wrong_address)['witness_program'])
         wrong_protocol_ID = b'\x43\x44\x52\x51'
         wrong_script_opreturn_hybrid = f"OP_RETURN {wrong_protocol_ID} {version} {int.from_bytes(hashlib.sha256(wrong_unsafe_schnorr_public_key + hashlib.sha256(scriptPubKey).digest()).digest())}"
-        witness_opreturn(wrong_script_opreturn_hybrid)
+        wrong_burned_scriptPubKey = tweak_pubkey([wrong_script_opreturn_hybrid, burned_script_path_dil])
+        witness_verification(1, burned_schnorr_public_key, burned_dil_public_key, wrong_burned_scriptPubKey, burned_dil_private_key, True, wrong_script_opreturn_hybrid, burned_script_path_dil, wrong_burned_scriptPubKey)
         self.assertFalse(hashlib.sha256(wrong_unsafe_schnorr_public_key + hashlib.sha256(scriptPubKey).digest()).digest()[::-1] in committed_opreturns)
 
         #Test if the wrong version records as a commit
@@ -119,7 +126,8 @@ class TestPhaseOne(unittest.TestCase):
         protocol_ID = b'\x43\x44\x52\x50'
         wrong_version = 10
         wrong_script_opreturn_hybrid = f"OP_RETURN {protocol_ID} {wrong_version} {int.from_bytes(hashlib.sha256(wrong_unsafe_schnorr_public_key + hashlib.sha256(scriptPubKey).digest()).digest())}"
-        witness_opreturn(wrong_script_opreturn_hybrid)
+        wrong_burned_scriptPubKey = tweak_pubkey([wrong_script_opreturn_hybrid, burned_script_path_dil])
+        witness_verification(1, burned_schnorr_public_key, burned_dil_public_key, wrong_burned_scriptPubKey, burned_dil_private_key, True, wrong_script_opreturn_hybrid, burned_script_path_dil, wrong_burned_scriptPubKey)
         self.assertFalse(hashlib.sha256(wrong_unsafe_schnorr_public_key + hashlib.sha256(scriptPubKey).digest()).digest()[::-1] in committed_opreturns)
 
     #All of these tests are done with the transaction target
@@ -160,7 +168,12 @@ class TestPhaseOne(unittest.TestCase):
         #Opreturn example for hybrid script
         script_opreturn_hybrid = f"OP_RETURN {protocol_ID} {version} {int.from_bytes(hashlib.sha256(unsafe_schnorr_public_key + hashlib.sha256(tweak_pubkey([script_path_schnorr, script_path_dil])).digest()).digest())}"
         #Commit unsafe
-        witness_opreturn(script_opreturn_hybrid)
+        burned_schnorr_private_key, burned_schnorr_public_key = dsa.gen_keys()
+        burned_dil_public_key, burned_dil_private_key = dilithium.Dilithium2.keygen()
+        burned_script_path_dil = f"{int.from_bytes(burned_dil_public_key, byteorder='little')} OP_CHECKDILITHIUMSIG"
+        burned_scriptPubKey = tweak_pubkey([script_opreturn_hybrid, burned_script_path_dil])
+        #This witness verification commits the opcode
+        witness_verification(1, burned_schnorr_public_key, burned_dil_public_key, burned_scriptPubKey, burned_dil_private_key, True, script_opreturn_hybrid, burned_script_path_dil, burned_scriptPubKey)
 
         #With this commit, we can send from unsafe to our tweaked pubkey
         #HOWEVER, we have not mined the required amount of blocks to confirm, so this fails
@@ -203,9 +216,11 @@ class TestPhaseOne(unittest.TestCase):
         unsafe_schnorr_public_key_new = bytes.fromhex(proxy.getaddressinfo(address_new)['witness_program'])
         #Opreturn example for hybrid script
         script_opreturn_hybrid_new = f"OP_RETURN {protocol_ID} {version} {int.from_bytes(hashlib.sha256(unsafe_schnorr_public_key_new + hashlib.sha256(tweak_pubkey([script_path_schnorr_new, script_path_dil_new])).digest()).digest())}"
+        burned_scriptPubKey_new = tweak_pubkey([script_opreturn_hybrid_new, burned_script_path_dil])
 
         #Commit unsafe public key
-        witness_opreturn(script_opreturn_hybrid_new)
+        #This witness verification commits the opcode
+        witness_verification(1, burned_schnorr_public_key, burned_dil_public_key, burned_scriptPubKey_new, burned_dil_private_key, True, script_opreturn_hybrid_new, burned_script_path_dil, burned_scriptPubKey_new)
 
         #Fund address 50 bitcoin
         #This mines 101 blocks, easily enough to confirm the op_return
